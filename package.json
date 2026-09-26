@@ -1,0 +1,33 @@
+{
+  "name": "parallelsandbox-mcp",
+  "version": "0.3.1",
+  "mcpName": "com.parallelsandbox/parallelsandbox",
+  "description": "stdio adapter for the ParallelSandbox MCP server: runs locally so sandbox_sync and sandbox_pull can move files between your machine and a box",
+  "type": "module",
+  "bin": {
+    "parallelsandbox-mcp": "index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "homepage": "https://parallelsandbox.com/en/docs/quickstart",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/parallel-sandbox/parallelsandbox-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/parallel-sandbox/parallelsandbox-mcp/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.19.1"
+  },
+  "scripts": {
+    "test": "node --test adapter.test.mjs"
+  }
+}
