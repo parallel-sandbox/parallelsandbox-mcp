@@ -33,6 +33,7 @@ claude mcp add --transport http parallelsandbox https://mcp.parallelsandbox.com/
 | `PARALLELSANDBOX_API_KEY` | required | API key from the app |
 | `PARALLELSANDBOX_MCP_URL` | `https://mcp.parallelsandbox.com/mcp` | MCP endpoint |
 | `PARALLELSANDBOX_API_URL` | `https://api.parallelsandbox.com` | REST base used by `sandbox_sync` |
+| `PSBX_ADAPTER_SILENCE_MS` | `75000` | How long a call's connection may stay silent before the adapter gives up on it (see Timeouts) |
 
 ## sandbox_sync
 
@@ -62,6 +63,14 @@ gone three minutes after its last heartbeat. Nothing else is sent: no prompt, no
 
 `sandbox_takeover` blocks until a person hands the box back, up to 30 minutes; the adapter waits 31 minutes for it and
 65 minutes for other calls (a foreground `sandbox_exec` runs at most 60 minutes).
+
+While a call runs, the server writes a "still running" line on its connection every 20 seconds (every 15 for
+`sandbox_takeover`). The adapter forwards those as MCP progress notifications when the client asked for progress, so
+a client that cancels calls after a stretch of silence (Claude Code does after 30 minutes) keeps waiting for a long build.
+If the connection ends without the result, or carries nothing for `PSBX_ADAPTER_SILENCE_MS`, the adapter returns an
+error right away instead of waiting out the timeout. Read-only tools (`sandbox_status`, `sandbox_list`, `sandbox_get`,
+the `logs_*` tools and the like) are retried once first. For anything else the error says the call may have run or
+even finished on the box: check `sandbox_status` (its `steps[]` lists what was run) before running it again.
 
 ## Source and issues
 

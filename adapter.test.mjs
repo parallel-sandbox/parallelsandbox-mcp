@@ -206,3 +206,135 @@ async function childLeaves(howToClose, wantCode) {
 
 test("client 關掉 stdin：先打 leave 再結束", () => childLeaves((c) => c.stdin.end(), 0));
 test("收到 SIGTERM：先打 leave 再結束", () => childLeaves((c) => c.kill("SIGTERM"), 143));
+
+// 假的 control MCP：tools/call 照工具名演出各種回應串流的死法。
+// 實際發生過：control 在第 363 秒把結果送完了，adapter 裡的 SDK 把它弄丟，呼叫一直掛到 Claude Code 30 分鐘砍掉。
+const mcpCalls = [];
+const hanging = new Set();
+const mcp = createServer((req, res) => {
+  if (req.method !== "POST") {
+    res.writeHead(405).end();
+    return;
+  }
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    const msg = JSON.parse(body);
+    if (msg.id === undefined) {
+      res.writeHead(202).end();
+      return;
+    }
+    const reply = (result) => ({ jsonrpc: "2.0", id: msg.id, result });
+    if (msg.method === "initialize") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(reply({ protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake-control", version: "1" } })));
+      return;
+    }
+    const name = msg.params?.name;
+    const call = { name, closed: false };
+    mcpCalls.push(call);
+    req.socket.on("close", () => (call.closed = true));
+    // control 的 keepAlive：20 秒後把回應升級成 SSE，之後定時送一則 still running。
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+    const event = (m) => res.write(`event: message\ndata: ${JSON.stringify(m)}\n\n`);
+    const ping = () => event({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: `${name} still running` } });
+    const done = () => event(reply({ content: [{ type: "text", text: `${name} done` }] }));
+    ping();
+    const tries = mcpCalls.filter((c) => c.name === name).length;
+    if (name === "ends_early" || (name === "sandbox_status" && tries === 1)) {
+      res.end(); // 串流結束了，結果沒來
+    } else if (name === "goes_silent") {
+      hanging.add(res); // 連線還在，一個位元組都不再來
+    } else {
+      let n = 0;
+      const t = setInterval(() => {
+        if (++n < 6) return ping();
+        clearInterval(t);
+        done();
+        res.end();
+      }, 200);
+    }
+  });
+});
+await new Promise((r) => mcp.listen(0, "127.0.0.1", r));
+mcp.unref();
+
+async function adapterClient() {
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+  const client = new Client({ name: "adapter-test", version: "1" });
+  await client.connect(new StdioClientTransport({
+    command: process.execPath,
+    args: [fileURLToPath(new URL("./index.mjs", import.meta.url))],
+    env: {
+      PARALLELSANDBOX_API_KEY: "test-key",
+      PARALLELSANDBOX_API_URL: process.env.PARALLELSANDBOX_API_URL,
+      PARALLELSANDBOX_MCP_URL: `http://127.0.0.1:${mcp.address().port}/mcp`,
+      PSBX_ADAPTER_SILENCE_MS: "1500",
+    },
+    stderr: "ignore",
+  }));
+  return client;
+}
+
+async function timed(p) {
+  const start = Date.now();
+  const out = await p;
+  return { out, sec: (Date.now() - start) / 1000 };
+}
+
+test("回應串流結束了卻沒有結果：幾秒內回錯，叫人先查 sandbox_status，不能掛著", async () => {
+  const client = await adapterClient();
+  try {
+    const { out, sec } = await timed(client.callTool({ name: "ends_early", arguments: {} }));
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /never came back.*ended without the result.*sandbox_status/s);
+    assert.ok(sec < 5, `要幾秒內回，花了 ${sec}s`);
+    assert.equal(mcpCalls.filter((c) => c.name === "ends_early").length, 1, "會改東西的工具不能自己重跑");
+  } finally {
+    await client.close();
+  }
+});
+
+test("連線一直開著卻沒有任何位元組：過了靜默上限就切掉連線、回錯", async () => {
+  const client = await adapterClient();
+  try {
+    const { out, sec } = await timed(client.callTool({ name: "goes_silent", arguments: {} }));
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /never came back.*no data from ParallelSandbox for \d+s.*sandbox_status/s);
+    assert.ok(sec >= 1.4 && sec < 5, `靜默上限 1.5 秒，花了 ${sec}s`);
+    const call = mcpCalls.findLast((c) => c.name === "goes_silent");
+    const deadline = Date.now() + 2000;
+    while (!call.closed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.ok(call.closed, "往 control 的那條連線要切掉，不能留著");
+  } finally {
+    for (const res of hanging) res.destroy();
+    await client.close();
+  }
+});
+
+test("control 一直出聲的長呼叫照常拿到結果，進度轉給 client", async () => {
+  const client = await adapterClient();
+  try {
+    const progress = [];
+    const { out, sec } = await timed(client.callTool({ name: "sandbox_exec", arguments: {} }, undefined, { onprogress: (p) => progress.push(p) }));
+    assert.equal(out.isError, undefined);
+    assert.equal(out.content[0].text, "sandbox_exec done");
+    assert.ok(sec > 1, `假 control 要跑 1.2 秒，花了 ${sec}s`);
+    assert.ok(progress.length >= 1, "control 出聲時要轉進度給 client");
+    assert.match(progress[0].message, /sandbox_exec still running/);
+  } finally {
+    await client.close();
+  }
+});
+
+test("只讀的工具結果弄丟了就自己重試一次", async () => {
+  const client = await adapterClient();
+  try {
+    const out = await client.callTool({ name: "sandbox_status", arguments: {} });
+    assert.equal(out.content[0].text, "sandbox_status done");
+    assert.equal(mcpCalls.filter((c) => c.name === "sandbox_status").length, 2);
+  } finally {
+    await client.close();
+  }
+});

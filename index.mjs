@@ -4,6 +4,7 @@
 // which compares the local directory with the box, tars only the files that differ and uploads them through
 // POST /v1/boxes/{id}/sync.
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { copyFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -82,7 +83,130 @@ const remote = new Client({ name: "parallelsandbox-mcp", version: "0.1.0" });
 const remoteHeaders = { Authorization: `Bearer ${API_KEY}` };
 const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
   requestInit: { headers: remoteHeaders },
+  fetch: watchedFetch,
 });
+// SDK 出錯（回應串流斷掉、解析不了）預設一個字都不留；寫到 stderr，client 的 MCP log 才查得到。
+remote.onerror = (err) => log("remote:", err?.message || err);
+
+// 每一次轉給 control 的呼叫都有看門狗。control 對跑超過 20 秒的工具每 20 秒在連線上送一則 still running
+// （sandbox_takeover 每 15 秒），所以正常的呼叫連線上一直有位元組。SDK 的 Streamable HTTP client 在回應串流斷掉、
+// 或串流結束了卻沒拿到結果時什麼都不做（伺服器沒給 event id 就不重連），那次呼叫會一直等到 65 分鐘逾時，
+// Claude Code 在 30 分鐘沒動靜時先砍掉。實際發生過：control 在第 363 秒把 10 KB 的結果送完了，這裡一直沒交出去，卡滿 30 分鐘。
+// 看門狗管兩件事：串流結束了 ENDED_GRACE_MS 還沒拿到結果；連線 SILENCE_MS 沒有任何位元組（就把它切掉）。兩種都立刻回錯。
+const SILENCE_MS = Number(process.env.PSBX_ADAPTER_SILENCE_MS) || 75_000;
+const ENDED_GRACE_MS = Math.min(5_000, SILENCE_MS / 3);
+const WATCH_TICK_MS = Math.min(5_000, SILENCE_MS / 5);
+// 轉給 client 的進度最多這麼久一則（client 靠它知道呼叫還活著，Claude Code 30 分鐘沒有就砍）。
+const PROGRESS_EVERY_MS = Math.min(10_000, SILENCE_MS / 3);
+const callScope = new AsyncLocalStorage();
+
+class CallWatch {
+  constructor(onAlive) {
+    this.onAlive = onAlive;
+    this.fetches = 0;
+    this.bytes = 0;
+    this.lastByte = Date.now();
+    this.lastTick = Date.now();
+    this.ended = null;
+    this.lost = null;
+    this.conn = new AbortController(); // 切掉往 control 的那條連線
+    this.call = new AbortController(); // 結束 SDK 裡等結果的那次呼叫
+  }
+  alive(n) {
+    this.lastByte = Date.now();
+    this.bytes += n;
+    if (n > 0) this.onAlive?.();
+  }
+  end(why) {
+    if (!this.ended) this.ended = { at: Date.now(), why };
+  }
+  check() {
+    const now = Date.now();
+    // 電腦睡著時計時器不跑：醒來看到的空檔不算連線沒聲音，重新給它一段時間。
+    if (now - this.lastTick > WATCH_TICK_MS * 3) this.lastByte = now;
+    this.lastTick = now;
+    if (this.ended && now - this.ended.at > ENDED_GRACE_MS) {
+      this.lose(`the response stream ${this.ended.why} without the result (${this.bytes} bytes received)`);
+    } else if (!this.ended && this.fetches > 0 && now - this.lastByte > SILENCE_MS) {
+      const why = `no data from ParallelSandbox for ${Math.round((now - this.lastByte) / 1000)}s (${this.bytes} bytes received)`;
+      this.conn.abort(new Error(why));
+      this.lose(why);
+    }
+  }
+  lose(why) {
+    if (this.lost) return;
+    this.lost = why;
+    this.call.abort(new Error(why));
+  }
+}
+
+// watchedFetch 是給 SDK 用的 fetch：在一次呼叫的範圍裡（callScope）發出去的請求，回應串流的每一塊都記在那次呼叫的看門狗上。
+async function watchedFetch(url, init = {}) {
+  const w = callScope.getStore();
+  if (!w) return fetch(url, init);
+  w.fetches++;
+  w.ended = null;
+  w.lastByte = Date.now();
+  const signal = init.signal ? anySignal(init.signal, w.conn.signal) : w.conn.signal;
+  const res = await fetch(url, { ...init, signal });
+  w.alive(0);
+  if (!res.body || [101, 204, 205, 304].includes(res.status)) {
+    w.end("closed");
+    return res;
+  }
+  const reader = res.body.getReader();
+  const body = new ReadableStream({
+    async pull(controller) {
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (err) {
+        w.end(`broke (${err?.message || err})`);
+        controller.error(err);
+        return;
+      }
+      if (chunk.done) {
+        w.end("ended");
+        controller.close();
+        return;
+      }
+      w.alive(chunk.value.byteLength);
+      controller.enqueue(chunk.value);
+    },
+    cancel(reason) {
+      w.end("was cancelled");
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+}
+
+// anySignal：兩個訊號任一個中止就中止（AbortSignal.any 要 Node 20.3 以上）。
+function anySignal(a, b) {
+  if (AbortSignal.any) return AbortSignal.any([a, b]);
+  const both = new AbortController();
+  for (const s of [a, b]) {
+    if (s.aborted) both.abort(s.reason);
+    else s.addEventListener("abort", () => both.abort(s.reason), { once: true });
+  }
+  return both.signal;
+}
+
+// callWatched 呼叫一次遠端工具；結果沒回來而是看門狗判定連線沒了，回 { lost }。
+async function callWatched(name, args, timeout, onAlive) {
+  const w = new CallWatch(onAlive);
+  const timer = setInterval(() => w.check(), WATCH_TICK_MS);
+  try {
+    const result = await callScope.run(w, () =>
+      remote.callTool({ name, arguments: args || {} }, undefined, { timeout, resetTimeoutOnProgress: true, signal: w.call.signal }));
+    return { result };
+  } catch (err) {
+    if (w.lost) return { lost: w.lost };
+    throw err;
+  } finally {
+    clearInterval(timer);
+  }
+}
 
 // 這個對話還在不在（control 的 agents 表）。一個 adapter 程序就是一個對話：啟動時取一個隨機 id 放在 X-Psbx-Agent，
 // control 記下每個箱子最後是哪個對話在動。第一次呼叫工具之後每分鐘打一次心跳；對話被關掉（stdin 斷、收到結束訊號）
@@ -546,24 +670,28 @@ const RETRY_SAFE = new Set([
   "logs_search", "logs_errors", "logs_tail",
 ]);
 
-// callWithRetry：transport 層的錯（fetch failed）再試一次；不能重試的就把話講清楚，
+// callWithRetry：連線沒了（fetch failed，或看門狗判定結果回不來）時，能重試的再試一次；不能重試的就把話講清楚，
 // 不要讓人以為「指令一定沒跑」。
-async function callWithRetry(name, args, timeout) {
+async function callWithRetry(name, args, timeout, onAlive) {
   const shotIsReadOnly = name === "sandbox_shot" && !(args || {}).record;
   const canRetry = RETRY_SAFE.has(name) || shotIsReadOnly;
-  try {
-    return await remote.callTool({ name, arguments: args || {} }, undefined, { timeout, resetTimeoutOnProgress: true });
-  } catch (err) {
-    const msg = err?.message || String(err);
-    if (!/fetch failed|socket hang up|ECONNRESET|ETIMEDOUT|EPIPE|network/i.test(msg)) throw err;
-    if (canRetry) {
-      return remote.callTool({ name, arguments: args || {} }, undefined, { timeout, resetTimeoutOnProgress: true });
+  for (let attempt = 0; ; attempt++) {
+    let out;
+    try {
+      out = await callWatched(name, args, timeout, onAlive);
+    } catch (err) {
+      const msg = err?.message || String(err);
+      if (!/fetch failed|socket hang up|ECONNRESET|ETIMEDOUT|EPIPE|network/i.test(msg)) throw err;
+      out = { lost: msg };
     }
-    return textResult(`${name}: the call did not complete (${msg}). It may still have started on the box: check sandbox_status or the box's activity before running it again.`, true);
+    if (!out.lost) return out.result;
+    log(`${name}: ${out.lost}`);
+    if (canRetry && attempt === 0) continue;
+    return textResult(`${name}: the result never came back (${out.lost}). It may have started or even finished on the box: check sandbox_status (steps[] lists what was run there) and what it should have produced before running it again.`, true);
   }
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
+server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   tellRemoteWhoIsCalling();
   startPresence();
   const { name, arguments: args } = req.params;
@@ -574,8 +702,25 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return pull(args);
   }
   const timeout = name === "sandbox_takeover" ? TAKEOVER_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
-  return callWithRetry(name, args, timeout);
+  return callWithRetry(name, args, timeout, progressRelay(name, req.params._meta?.progressToken, extra));
 });
+
+// progressRelay：control 在連線上出聲（still running）時，轉一則進度給 client。client 有給 progressToken 才轉。
+// 沒有這個，Claude Code 只看得到「30 分鐘沒動靜」，跑超過 30 分鐘的 build 會被它砍掉。
+function progressRelay(name, token, extra) {
+  if (token === undefined) return undefined;
+  const started = Date.now();
+  let sent = 0;
+  return () => {
+    const now = Date.now();
+    if (now - sent < PROGRESS_EVERY_MS) return;
+    sent = now;
+    extra.sendNotification({
+      method: "notifications/progress",
+      params: { progressToken: token, progress: (now - started) / 1000, message: `${name} still running (${Math.round((now - started) / 1000)}s)` },
+    }).catch(() => {});
+  };
+}
 
 if (connect) {
   watchForExit();
