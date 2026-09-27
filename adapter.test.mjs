@@ -1,7 +1,7 @@
 // 同步挑檔的規則錯了就是「箱子裡少東西」或「上傳幾 GB」，兩種都很難查，所以這幾個純函式要有測試。
 import { strict as assert } from "node:assert";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { createReadStream, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,7 +26,7 @@ api.unref();
 process.env.PSBX_ADAPTER_NO_CONNECT = "1";
 process.env.PARALLELSANDBOX_API_KEY = process.env.PARALLELSANDBOX_API_KEY || "test-key";
 process.env.PARALLELSANDBOX_API_URL = `http://127.0.0.1:${api.address().port}`;
-const { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, syncTool } = await import("./index.mjs");
+const { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, syncTool, unpackDirectory } = await import("./index.mjs");
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "psbx-adapter-test-"));
@@ -117,6 +117,25 @@ test("目錄只有部分檔被忽略時，不能把整個目錄講成沒送", ()
     const r = ignoredTopLevel(dir);
     assert.deepEqual(r.skipped, ["dist"], "整個沒送的只有 dist");
     assert.deepEqual(r.partiallyIgnored, ["config"], "config 有送，只是裡面少幾個檔");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sandbox_pull 拉資料夾：裡面的東西直接放進 localPath，不多一層資料夾名", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "psbx-pull-"));
+  try {
+    // 照箱子打包的方式：tar -czf <檔> -C <上一層> <資料夾名>
+    mkdirSync(join(dir, "box", "app", "dist", "assets"), { recursive: true });
+    writeFileSync(join(dir, "box", "app", "dist", "index.html"), "<html></html>\n");
+    writeFileSync(join(dir, "box", "app", "dist", "assets", "a.js"), "x\n");
+    const archive = join(dir, "dist.tar.gz");
+    execFileSync("tar", ["-czf", archive, "-C", join(dir, "box", "app"), "dist"]);
+    const target = join(dir, "local", "dist");
+    await unpackDirectory(createReadStream(archive), target);
+    assert.equal(readFileSync(join(target, "index.html"), "utf8"), "<html></html>\n");
+    assert.equal(readFileSync(join(target, "assets", "a.js"), "utf8"), "x\n");
+    assert.ok(!existsSync(join(target, "dist")), "不該多一層 dist/dist");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

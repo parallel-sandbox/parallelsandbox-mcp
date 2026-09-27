@@ -48,8 +48,11 @@ deleted locally stay in the box.
 ## sandbox_pull
 
 `{"id": "<box id>", "path": "<path under /work>", "localPath": "/abs/path/on/your/machine"}` downloads a file or a
-directory from the box. A directory arrives as a tar.gz and is extracted into `localPath` (pass `"extract": false` to keep
-the archive); a file is written to `localPath`. Relative paths resolve the same way as for `sandbox_sync`.
+directory from the box. A file is written to `localPath`. A directory's contents are extracted straight into `localPath`,
+the reverse of `sandbox_sync`: `path` `app/dist` with `localPath` `/abs/dist` gives `/abs/dist/index.html`, not
+`/abs/dist/dist/index.html` (versions before 0.3.3 added that extra level). Pass `"extract": false` to keep the tar.gz
+as one file instead; it holds the directory itself as its top entry. Relative paths resolve the same way as for
+`sandbox_sync`. Only the local copy stays: the hand-off copy on ParallelSandbox's side is deleted after about a day.
 
 ## Which conversation is using a box
 

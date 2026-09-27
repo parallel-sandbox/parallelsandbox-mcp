@@ -458,6 +458,22 @@ function copyInto(src, dir, paths) {
   return {};
 }
 
+// unpackDirectory 把 sandbox_get 回的資料夾 tar.gz 解進 target。箱子打包時帶著資料夾本身那一層
+// （tar -C <上一層> <資料夾名>），這裡把那一層去掉，資料夾裡的東西直接放進 target：
+// path /work/app/dist、localPath ./dist 拿到 ./dist/<內容>，跟 sandbox_sync 反方向一樣。以前會多一層變成 ./dist/dist/…
+async function unpackDirectory(stream, target) {
+  mkdirSync(target, { recursive: true });
+  const tar = spawn("tar", ["-xzf", "-", "-C", target, "--strip-components=1"]);
+  const errs = [];
+  tar.stderr.on("data", (d) => errs.push(d.toString()));
+  await new Promise((res2, rej) => {
+    stream.on("error", rej);
+    stream.pipe(tar.stdin);
+    tar.on("close", (code) => (code === 0 ? res2() : rej(new Error(errs.join("").trim() || `tar exit ${code}`))));
+    tar.on("error", rej);
+  });
+}
+
 // pull 把箱子裡的檔案或資料夾寫回本機路徑：sandbox_get 只給預簽網址，之前都要自己 curl 或 base64 貼回來。
 async function pull(args) {
   const { id, path: boxPath, localPath, extract = true } = args || {};
@@ -475,15 +491,7 @@ async function pull(args) {
   if (!dl.ok) return textResult(`sandbox_pull: download failed (${dl.status})`, true);
   const target = resolve(process.cwd(), localPath);
   if (meta.archive && extract) {
-    mkdirSync(target, { recursive: true });
-    const tar = spawn("tar", ["-xzf", "-", "-C", target]);
-    const errs = [];
-    tar.stderr.on("data", (d) => errs.push(d.toString()));
-    await new Promise((res2, rej) => {
-      Readable.fromWeb(dl.body).pipe(tar.stdin);
-      tar.on("close", (code) => (code === 0 ? res2() : rej(new Error(errs.join("").trim() || `tar exit ${code}`))));
-      tar.on("error", rej);
-    });
+    await unpackDirectory(Readable.fromWeb(dl.body), target);
     return textResult(JSON.stringify({ ok: true, localPath: target, bytes: meta.bytes, extracted: true }, null, 2));
   }
   mkdirSync(dirname(target), { recursive: true });
@@ -727,4 +735,4 @@ if (connect) {
   await server.connect(new StdioServerTransport());
 }
 
-export { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, startPresence, sync as syncTool, watchForExit };
+export { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, startPresence, sync as syncTool, unpackDirectory, watchForExit };
