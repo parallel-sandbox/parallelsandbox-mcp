@@ -7,9 +7,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { copyFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -445,15 +445,48 @@ function archiveCommit(src, commit) {
   return { dir };
 }
 
-// copyInto 把工作區的某些路徑疊到乾淨樹上（commit + 自己正在改的檔）。
-function copyInto(src, dir, paths) {
-  for (const rel of paths) {
-    const from = resolve(src, rel);
-    if (!existsSync(from)) return { error: `alsoPaths: ${rel} not found under ${src}` };
-    const to = resolve(dir, rel);
-    mkdirSync(dirname(to), { recursive: true });
-    const cp = spawnSync("cp", ["-a", from, to], { encoding: "utf8" });
-    if (cp.status !== 0) return { error: `alsoPaths: copy ${rel}: ${(cp.stderr || "").trim()}` };
+// copyInto 把工作區的某些路徑疊到乾淨樹上（commit + 自己正在改的檔），每個路徑都換成工作區裡的樣子。
+// 檔案照原樣複製。資料夾整個換掉，裡面放不帶 commit 同步時會從那裡送的檔（追蹤中的加上沒被 .gitignore 忽略的新檔）：
+// 本機刪掉、改名的檔不會從 commit 那份冒回來，node_modules、build 產物也不會上去蓋掉箱子裡自己裝的；
+// includeIgnored 時照磁碟上的樣子整份複製。
+// 以前資料夾是 cp -a 到樹裡已經有的同名資料夾，cp 會把它放進「裡面」：箱子裡多一層 parallelsandbox/parallelsandbox/，
+// vite 從那份舊檔解析 import 失敗，tsc 也跟著檢查舊的那份。
+function copyInto(src, dir, paths, includeIgnored = false) {
+  try {
+    const root = realpathSync(dir);
+    for (const rel of paths) {
+      const sub = relative(src, resolve(src, rel));
+      if (!sub || sub === ".." || sub.startsWith(`..${sep}`) || isAbsolute(sub)) return { error: `alsoPaths: ${rel} is not a path under ${src}` };
+      const from = join(src, sub);
+      let st;
+      try {
+        st = lstatSync(from);
+      } catch {
+        return { error: `alsoPaths: ${rel} not found under ${src}` };
+      }
+      const to = join(dir, sub);
+      // 下面會先刪掉樹裡原本那份。路徑中間要是有連結，刪和寫都會穿出這棵暫存樹，落到連結指的地方（可能就是工作區本身）。
+      let up = dirname(to);
+      while (!existsSync(up)) up = dirname(up);
+      const real = realpathSync(up);
+      if (real !== root && !real.startsWith(root + sep)) return { error: `alsoPaths: ${rel} goes through a symlink that leads out of the tree` };
+      const list = st.isDirectory() && !includeIgnored ? gitFileList(from) : null;
+      if (list && !list.length) return { error: `alsoPaths: git sends nothing under ${rel} (empty, or all of it ignored); pass includeIgnored: true to copy it as it is on disk` };
+      rmSync(to, { recursive: true, force: true });
+      mkdirSync(dirname(to), { recursive: true });
+      let cp;
+      if (!st.isDirectory()) {
+        cp = spawnSync("cp", ["-a", from, to], { encoding: "utf8" });
+      } else {
+        mkdirSync(to);
+        cp = list
+          ? spawnSync("bash", ["-c", 'set -o pipefail; tar -cf - -C "$0" --null -T - | tar -xf - -C "$1"', from, to], { input: list, env: { ...process.env, COPYFILE_DISABLE: "1" }, encoding: "utf8" })
+          : spawnSync("cp", ["-a", `${from}/.`, to], { encoding: "utf8" });
+      }
+      if (cp.status !== 0) return { error: `alsoPaths: copy ${rel}: ${(cp.stderr || "").trim()}` };
+    }
+  } catch (err) {
+    return { error: `alsoPaths: ${err?.message || err}` };
   }
   return {};
 }
@@ -551,7 +584,7 @@ async function sync(args) {
     temp = made.dir;
     src = made.dir;
     if (Array.isArray(alsoPaths) && alsoPaths.length) {
-      const copied = copyInto(given, temp, alsoPaths);
+      const copied = copyInto(given, temp, alsoPaths, includeIgnored);
       if (copied.error) {
         rmSync(temp, { recursive: true, force: true });
         return textResult(copied.error, true);

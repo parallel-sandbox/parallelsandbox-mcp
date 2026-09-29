@@ -1,20 +1,21 @@
 // 同步挑檔的規則錯了就是「箱子裡少東西」或「上傳幾 GB」，兩種都很難查，所以這幾個純函式要有測試。
 import { strict as assert } from "node:assert";
 import { execFileSync, spawn } from "node:child_process";
-import { createReadStream, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { createReadStream, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-// 假的 control：只記下 adapter 打來的請求（心跳、離開）。
+// 假的 control：只記下 adapter 打來的請求（心跳、離開、sync 上傳的那包 tar.gz）。
 const seen = [];
 const api = createServer((req, res) => {
-  let body = "";
-  req.on("data", (c) => (body += c));
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
-    seen.push({ method: req.method, url: req.url, headers: req.headers, body });
+    const raw = Buffer.concat(chunks);
+    seen.push({ method: req.method, url: req.url, headers: req.headers, body: raw.toString(), raw });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end('{"ok":true}');
   });
@@ -81,6 +82,91 @@ test("alsoPaths 把自己正在改的檔疊回乾淨樹上", () => {
   } finally {
     if (made?.dir) rmSync(made.dir, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 9/29 實際發生過：alsoPaths 給 renderer/src/components/plugins/parallelsandbox，箱子裡多一層 parallelsandbox/parallelsandbox/，
+// vite 從那份舊檔解析 import 失敗，tsc 也檢查到它。
+test("alsoPaths 給資料夾：整個換成工作區那份，不多一層、本機刪掉的不留、被忽略的不帶", () => {
+  const { dir, git } = repo();
+  let made;
+  try {
+    const ui = join(dir, "web", "ui");
+    mkdirSync(join(ui, "pages"), { recursive: true });
+    writeFileSync(join(ui, "a.ts"), "export const a = 1;\n");
+    writeFileSync(join(ui, "old.ts"), "import '../gone';\n");
+    writeFileSync(join(ui, "pages", "p.ts"), "p\n");
+    git("add", "-A");
+    git("commit", "-qm", "ui");
+    writeFileSync(join(ui, "a.ts"), "export const a = 2; // 我的改動\n");
+    rmSync(join(ui, "old.ts"));
+    writeFileSync(join(ui, "new.ts"), "還沒 add 的新檔\n");
+    mkdirSync(join(ui, "node_modules", "x"), { recursive: true });
+    writeFileSync(join(ui, "node_modules", "x", "index.js"), "本機裝的\n");
+    made = archiveCommit(dir, git("rev-parse", "HEAD").trim());
+    const got = join(made.dir, "web", "ui");
+
+    assert.equal(copyInto(dir, made.dir, ["web/ui"]).error, undefined);
+    assert.ok(!existsSync(join(got, "ui")), "不能多一層 web/ui/ui");
+    assert.equal(readFileSync(join(got, "a.ts"), "utf8"), "export const a = 2; // 我的改動\n");
+    assert.equal(readFileSync(join(got, "new.ts"), "utf8"), "還沒 add 的新檔\n");
+    assert.equal(readFileSync(join(got, "pages", "p.ts"), "utf8"), "p\n");
+    assert.ok(!existsSync(join(got, "old.ts")), "本機刪掉的檔不能從 commit 那份冒回來");
+    assert.ok(!existsSync(join(got, "node_modules")), ".gitignore 忽略的不送，免得蓋掉箱子裡自己裝的");
+
+    assert.equal(copyInto(dir, made.dir, ["web/ui/"], true).error, undefined);
+    assert.ok(existsSync(join(got, "node_modules", "x", "index.js")), "includeIgnored 照磁碟上的樣子整份複製");
+    assert.ok(!existsSync(join(got, "ui")));
+
+    assert.match(copyInto(dir, made.dir, ["dist"]).error, /includeIgnored/, "整個被忽略的資料夾不能默默送一個空的");
+  } finally {
+    if (made?.dir) rmSync(made.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// copyInto 會先刪掉樹裡原本那份：路徑一旦穿出暫存樹，刪的就是別處的真檔案。
+test("alsoPaths 刪不到也寫不到樹外面：../、絕對路徑、穿出去的連結都擋下", () => {
+  const { dir, git } = repo();
+  const outside = mkdtempSync(join(tmpdir(), "psbx-outside-"));
+  let made;
+  try {
+    writeFileSync(join(outside, "keep.txt"), "別刪我\n");
+    symlinkSync(outside, join(dir, "linked"));
+    git("add", "-A");
+    git("commit", "-qm", "link");
+    made = archiveCommit(dir, "HEAD");
+    for (const rel of ["../x", outside, ".", "linked/keep.txt"]) {
+      assert.ok(copyInto(dir, made.dir, [rel]).error, `${rel} 要擋下`);
+    }
+    assert.equal(copyInto(dir, made.dir, ["linked"]).error, undefined, "連結本身照樣複製");
+    assert.equal(readFileSync(join(outside, "keep.txt"), "utf8"), "別刪我\n");
+  } finally {
+    if (made?.dir) rmSync(made.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("commit + alsoPaths 資料夾：送進箱子的那包裡是工作區那份，沒有巢狀的同名資料夾", async () => {
+  const { dir, git } = repo();
+  const box = mkdtempSync(join(tmpdir(), "psbx-box-"));
+  try {
+    mkdirSync(join(dir, "ui"));
+    writeFileSync(join(dir, "ui", "a.ts"), "1\n");
+    git("add", "-A");
+    git("commit", "-qm", "ui");
+    writeFileSync(join(dir, "ui", "a.ts"), "2\n");
+    const res = await syncTool({ id: "bx", localPath: dir, dest: "app", commit: "HEAD", alsoPaths: ["ui"] });
+    assert.equal(res.isError, false, res.content[0].text);
+    const upload = seen.findLast((r) => r.url.startsWith("/v1/boxes/bx/sync?dest=app"));
+    execFileSync("tar", ["-xzf", "-", "-C", box], { input: upload.raw });
+    assert.equal(readFileSync(join(box, "ui", "a.ts"), "utf8"), "2\n");
+    assert.ok(!existsSync(join(box, "ui", "ui")), "箱子裡不能多一層 ui/ui");
+    assert.equal(readFileSync(join(box, "main.go"), "utf8"), "package main\n");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(box, { recursive: true, force: true });
   }
 });
 
