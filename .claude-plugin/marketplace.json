@@ -1,0 +1,11 @@
+{
+  "name": "parallelsandbox",
+  "owner": { "name": "ParallelSandbox" },
+  "plugins": [
+    {
+      "name": "parallelsandbox",
+      "source": "./",
+      "description": "ParallelSandbox tools and development native-channel checks; automatic feedback routing is currently unsupported."
+    }
+  ]
+}

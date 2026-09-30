@@ -47,6 +47,10 @@ claude mcp add --transport http parallelsandbox https://mcp.parallelsandbox.com/
 | `PARALLELSANDBOX_API_URL` | `https://api.parallelsandbox.com` | REST base used by `sandbox_sync` |
 | `PSBX_TOOL_TIMEOUT_SEC` | `60` | The MCP host’s configured absolute tool deadline in seconds; used to declare a safe review wait (default 25 seconds, maximum 1800) |
 | `PSBX_ADAPTER_SILENCE_MS` | `75000` | How long a call's connection may stay silent before the adapter gives up on it (see Timeouts) |
+| `PSBX_FEEDBACK_HOST` | unset | Development feedback bridge: `claude-code` or `codex`; ordinary MCP connections remain unchanged |
+| `PSBX_CODEX_CLI` | unset | Absolute CLI path for an explicitly paired, existing official Codex App Server |
+| `PSBX_CODEX_HOST_SOCKET` | unset | Absolute path to that existing App Server's private control socket; Desktop IPC is unsupported |
+| `PSBX_CODEX_FEEDBACK_DIR` | `~/.cache/parallelsandbox/codex-feedback` | Private binding tickets shared by the Codex hook and adapter |
 
 When using a dev endpoint, set both `PARALLELSANDBOX_MCP_URL` and `PARALLELSANDBOX_API_URL` to its dev addresses.
 
@@ -71,7 +75,7 @@ as one file instead; it holds the directory itself as its top entry. Relative pa
 
 ## Which conversation is using a box
 
-Each time the adapter starts it picks a random id and sends it as `X-Psbx-Agent` on every call. After the first tool call
+Ordinary MCP connections choose a random id when the adapter starts and send it as `X-Psbx-Agent` on every call. Registered native sessions keep one supervisor-owned id across all turns; the supervisor maintains its presence until it stops. After the first tool call
 it reports to `/v1/agents/<id>/heartbeat` once a minute, and when its conversation closes (stdin ends, or SIGTERM, SIGINT
 or SIGHUP) it reports `/v1/agents/<id>/leave`. The app uses this to tell a box the AI is still working in from one whose
 conversation was closed without `sandbox_review` or `sandbox_stop`; a conversation killed outright (no leave) counts as
@@ -85,7 +89,34 @@ includes the review ID and entry URL before the final result. Use `waitSec: 0` f
 or resume a timed-out round with `reviewId` instead of creating another card with `what`. The adapter waits 31 minutes
 for takeover and review, and 65 minutes for other calls (a foreground `sandbox_exec` runs at most 60 minutes).
 Cancelling a client call also cancels its control connection; it does not delete the review or feedback.
-This works while that tool call is active; MCP does not wake a conversation that has already stopped.
+The waiting-tool route lasts for that active call. Registered native sessions use the supervisor below to continue after a turn exits.
+
+## Continue after the AI finishes
+
+`parallelsandbox-agent` runs a persistent supervisor for a registered native Claude Code, Codex or Gemini CLI session.
+The first prompt and every subsequent prompt use that provider's native conversation history. A review created in that
+session registers its box and review with the same supervisor. After an App report is submitted, the supervisor claims
+it, waits until the current native turn has exited, and resumes the exact saved native session UUID. The resumed AI
+calls `sandbox_report` to receive text, images, recordings and timed transcripts through its native MCP connection.
+Only a successful native turn with that report read can acknowledge delivery. The App receipt polls independently after
+submission; “received” does not mean the requested change is complete.
+
+```bash
+npx -y --package parallelsandbox-mcp parallelsandbox-agent start \
+  --provider claude-code --cli /absolute/path/to/claude --cwd /absolute/path/to/project \
+  --prompt "Work on this project and use sandbox_review when it is ready to try."
+```
+
+Choose `codex` with its native Codex executable or `gemini` with its native Gemini executable in the same command.
+The command returns the exact session directory. Use `send --session <directory> --prompt <text>` for later prompts,
+`status --session <directory>` to read results, and `stop --session <directory>` to stop that supervisor. Provider
+runtime credentials must be available: `ANTHROPIC_API_KEY`, `CODEX_API_KEY`/`OPENAI_API_KEY`, or `GEMINI_API_KEY` with a valid provider endpoint. The runner uses a private native configuration directory; global CLI OAuth sign-in is not automatically inherited. See [SESSION_FEEDBACK.md](SESSION_FEEDBACK.md) for configuration,
+recovery and the permission profile.
+
+Registration happens when the original session is started with this runner. Adding an MCP server alone to an existing,
+unregistered private Desktop conversation does not provide a wake endpoint. This runner does not substitute another
+conversation for one it cannot control. The older experimental Claude Channel and paired Codex App Server bridges
+remain separate opt-in integrations; they are not the delivery mechanism of the registered native runner.
 
 To wait the full 30 minutes in Codex, set `tool_timeout_sec = 1920` for this MCP server and
 `PSBX_TOOL_TIMEOUT_SEC = "1920"` in that server's adapter environment, then restart/reconnect the server using adapter

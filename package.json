@@ -1,15 +1,31 @@
 {
   "name": "parallelsandbox-mcp",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "mcpName": "com.parallelsandbox/parallelsandbox",
   "description": "stdio adapter for the ParallelSandbox MCP server: runs locally so sandbox_sync and sandbox_pull can move files between your machine and a box",
   "type": "module",
   "bin": {
-    "parallelsandbox-mcp": "index.mjs"
+    "parallelsandbox-mcp": "index.mjs",
+    "parallelsandbox-codex-hook": "codex-host-hook.mjs",
+    "parallelsandbox-agent": "feedback-agent.mjs"
   },
   "files": [
     "index.mjs",
     "oauth.mjs",
+    "claude-channel.mjs",
+    "codex-host.mjs",
+    "codex-host-hook.mjs",
+    "feedback-agent.mjs",
+    "session-host.mjs",
+    "session-bridge.mjs",
+    "native-claude.mjs",
+    "native-codex.mjs",
+    "native-gemini.mjs",
+    ".claude-plugin",
+    ".mcp.json",
+    "CLAUDE_CHANNEL.md",
+    "CODEX_FEEDBACK.md",
+    "SESSION_FEEDBACK.md",
     "README.md",
     "LICENSE"
   ],
@@ -29,6 +45,6 @@
     "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "scripts": {
-    "test": "node --test adapter.test.mjs oauth.test.mjs"
+    "test": "node --test *.test.mjs"
   }
 }
