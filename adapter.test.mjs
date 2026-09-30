@@ -27,7 +27,7 @@ api.unref();
 process.env.PSBX_ADAPTER_NO_CONNECT = "1";
 process.env.PARALLELSANDBOX_API_KEY = process.env.PARALLELSANDBOX_API_KEY || "test-key";
 process.env.PARALLELSANDBOX_API_URL = `http://127.0.0.1:${api.address().port}`;
-const { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, syncTool, unpackDirectory } = await import("./index.mjs");
+const { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, reviewWaitBudget, syncTool, unpackDirectory } = await import("./index.mjs");
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "psbx-adapter-test-"));
@@ -336,7 +336,7 @@ const mcp = createServer((req, res) => {
       return;
     }
     const name = msg.params?.name;
-    const call = { name, closed: false };
+    const call = { name, closed: false, reviewBudget: req.headers["x-psbx-review-wait-sec"] };
     mcpCalls.push(call);
     req.socket.on("close", () => (call.closed = true));
     // control 的 keepAlive：20 秒後把回應升級成 SSE，之後定時送一則 still running。
@@ -346,25 +346,30 @@ const mcp = createServer((req, res) => {
     const done = () => event(reply({ content: [{ type: "text", text: `${name} done` }] }));
     ping();
     const tries = mcpCalls.filter((c) => c.name === name).length;
-    if (name === "ends_early" || (name === "sandbox_status" && tries === 1)) {
+    if (name === "ends_early" || (name === "sandbox_report" && tries === 1) || name === "sandbox_status") {
       res.end(); // 串流結束了，結果沒來
     } else if (name === "goes_silent") {
       hanging.add(res); // 連線還在，一個位元組都不再來
     } else {
+      if (name === "sandbox_review" && msg.params._meta?.progressToken !== undefined) {
+        event({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: msg.params._meta.progressToken, progress: 0, total: 1800, message: "Review round-1 is available now: https://app.example.test/box/box-1; waiting for feedback" } });
+      }
       let n = 0;
       const t = setInterval(() => {
+        if (name === "sandbox_review" && msg.params.arguments.reviewId === "cancel-round") return ping();
         if (++n < 6) return ping();
         clearInterval(t);
         done();
         res.end();
       }, 200);
+      res.on("close", () => clearInterval(t));
     }
   });
 });
 await new Promise((r) => mcp.listen(0, "127.0.0.1", r));
 mcp.unref();
 
-async function adapterClient() {
+async function adapterClient(env = {}) {
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
   const client = new Client({ name: "adapter-test", version: "1" });
@@ -376,6 +381,7 @@ async function adapterClient() {
       PARALLELSANDBOX_API_URL: process.env.PARALLELSANDBOX_API_URL,
       PARALLELSANDBOX_MCP_URL: `http://127.0.0.1:${mcp.address().port}/mcp`,
       PSBX_ADAPTER_SILENCE_MS: "1500",
+      ...env,
     },
     stderr: "ignore",
   }));
@@ -433,13 +439,75 @@ test("control 一直出聲的長呼叫照常拿到結果，進度轉給 client",
   }
 });
 
-test("只讀的工具結果弄丟了就自己重試一次", async () => {
+test("持久 report 重讀的結果弄丟了就自己重試一次", async () => {
   const client = await adapterClient();
   try {
-    const out = await client.callTool({ name: "sandbox_status", arguments: {} });
-    assert.equal(out.content[0].text, "sandbox_status done");
-    assert.equal(mcpCalls.filter((c) => c.name === "sandbox_status").length, 2);
+    const out = await client.callTool({ name: "sandbox_report", arguments: { id: "box-1", reportId: "report-1" } });
+    assert.equal(out.content[0].text, "sandbox_report done");
+    assert.equal(mcpCalls.filter((c) => c.name === "sandbox_report").length, 2);
   } finally {
     await client.close();
   }
+});
+
+test("status 可能已領取一次性 fromHuman：結果遺失不能自動重試而藏掉回饋", async () => {
+  const client = await adapterClient();
+  try {
+    const out = await client.callTool({ name: "sandbox_status", arguments: { id: "box-1" } });
+    assert.equal(out.isError, true);
+    assert.equal(mcpCalls.filter((c) => c.name === "sandbox_status").length, 1);
+  } finally {
+    await client.close();
+  }
+});
+
+test("review 等待的進度保留原round及可開啟URL", async () => {
+  const client = await adapterClient();
+  try {
+    const progress = [];
+    const out = await client.callTool({ name: "sandbox_review", arguments: { id: "box-1", reviewId: "round-1" } }, undefined, { onprogress: (p) => progress.push(p) });
+    assert.equal(out.content[0].text, "sandbox_review done");
+    assert.ok(progress.some((p) => /round-1.*https:\/\/app\.example\.test/.test(p.message)), "語意進度不能被still running蓋掉");
+    assert.ok(progress.every((p, i) => i === 0 || p.progress >= progress[i - 1].progress), "byte heartbeat與remote進度交錯時不能倒退");
+  } finally {
+    await client.close();
+  }
+});
+
+test("client 取消review等待會關閉control連線，不留下背景等待", async () => {
+  const client = await adapterClient();
+  const cancel = new AbortController();
+  try {
+    const waiting = client.callTool({ name: "sandbox_review", arguments: { id: "box-1", reviewId: "cancel-round" } }, undefined, { signal: cancel.signal, onprogress: () => {} });
+    const rejected = assert.rejects(waiting);
+    const deadline = Date.now() + 3000;
+    while (!mcpCalls.findLast((c) => c.name === "sandbox_review" && !c.closed) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+    const call = mcpCalls.findLast((c) => c.name === "sandbox_review");
+    assert.ok(call && !call.closed, "取消前control應仍在等");
+    cancel.abort(new Error("new user input"));
+    await rejected;
+    const closedBy = Date.now() + 2000;
+    while (!call.closed && Date.now() < closedBy) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(call.closed, "取消必須傳到HTTP，而非只取消本機結果");
+  } finally {
+    await client.close();
+  }
+});
+
+
+test("review budget reflects the configured host deadline, not the adapter SDK timer", () => {
+ for (const [configured,want] of [[undefined,25],["bad",25],["60",25],["10",0],["1920",1800],["3600",1800]]) {
+  assert.equal(reviewWaitBudget(configured),want,String(configured));
+ }
+});
+
+test("review transport declares the real host budget for both default and configured clients", async () => {
+ for (const [env,want] of [[{},"25"],[{PSBX_TOOL_TIMEOUT_SEC:"1920"},"1800"]]) {
+  const client = await adapterClient(env);
+  try {
+   const out = await client.callTool({name:"sandbox_review",arguments:{reviewId:"budget-round"}});
+   assert.equal(out.isError,undefined);
+   assert.equal(mcpCalls.findLast(c=>c.name==="sandbox_review").reviewBudget,want);
+  } finally {await client.close();}
+ }
 });

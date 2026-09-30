@@ -1,6 +1,6 @@
 {
   "name": "parallelsandbox-mcp",
-  "version": "0.3.4",
+  "version": "0.4.2",
   "mcpName": "com.parallelsandbox/parallelsandbox",
   "description": "stdio adapter for the ParallelSandbox MCP server: runs locally so sandbox_sync and sandbox_pull can move files between your machine and a box",
   "type": "module",
@@ -9,6 +9,7 @@
   },
   "files": [
     "index.mjs",
+    "oauth.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -25,9 +26,9 @@
     "url": "https://github.com/parallel-sandbox/parallelsandbox-mcp/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.19.1"
+    "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "scripts": {
-    "test": "node --test adapter.test.mjs"
+    "test": "node --test adapter.test.mjs oauth.test.mjs"
   }
 }

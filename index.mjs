@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // parallelsandbox-mcp: stdio in, ParallelSandbox Streamable HTTP out.
-// Every tool call is forwarded to https://mcp.parallelsandbox.com/mcp with the API key, except sandbox_sync,
+// Every tool call is forwarded to https://mcp.parallelsandbox.com/mcp with OAuth (or an optional API key), except sandbox_sync,
 // which compares the local directory with the box, tars only the files that differ and uploads them through
 // POST /v1/boxes/{id}/sync.
 
@@ -16,12 +16,19 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { LoginRequired, OAuthSession } from "./oauth.mjs";
 
 const API_KEY = process.env.PARALLELSANDBOX_API_KEY || "";
 const MCP_URL = process.env.PARALLELSANDBOX_MCP_URL || "https://mcp.parallelsandbox.com/mcp";
 const API_URL = (process.env.PARALLELSANDBOX_API_URL || "https://api.parallelsandbox.com").replace(/\/+$/, "");
 const TAKEOVER_TIMEOUT_MS = 31 * 60 * 1000;
 const DEFAULT_TIMEOUT_MS = 65 * 60 * 1000;
+// The host's absolute tool deadline is independent of this adapter's SDK timer.
+function reviewWaitBudget(hostTimeoutSec = process.env.PSBX_TOOL_TIMEOUT_SEC) {
+ const parsed = Number(hostTimeoutSec);
+ const hostSec = Number.isFinite(parsed) && parsed > 0 ? parsed : 60;
+ return Math.min(1800, Math.max(0, Math.floor(hostSec) - 35));
+}
 const SYNC_EXCLUDES = ["node_modules", ".git", "dist", "dist-web", "build", ".cache", "coverage", ".venv", "venv", "__pycache__", "target", ".next", ".turbo"];
 // 箱子回報要傳的檔超過這個數就整包傳：清單比整包還長時比對沒有意義，exec 的輸出也有上限。
 const COMPARE_LIMIT = 400;
@@ -72,19 +79,15 @@ console.log(JSON.stringify({ changed }));
 
 const log = (...args) => console.error("[parallelsandbox-mcp]", ...args);
 
-if (!API_KEY) {
-  log("PARALLELSANDBOX_API_KEY is required (create a key in the app at https://app.parallelsandbox.com)");
-  process.exit(2);
-}
+const oauth = API_KEY ? null : new OAuthSession({ mcpUrl: MCP_URL, log });
+const authorizedFetch = (url, init) => oauth ? oauth.fetch(url, init) : fetch(url, init);
 
-const remote = new Client({ name: "parallelsandbox-mcp", version: "0.1.0" });
+const remote = new Client({ name: "parallelsandbox-mcp", version: "0.4.2" });
 // 同一個 headers 物件每次請求都會被讀到，所以握手拿到對方是誰之後直接塞進去。
 // 沒有這個，control 只知道「某個 API key 開了箱子」，人在 app 裡看不出是 Claude 還是 Codex 在用。
-const remoteHeaders = { Authorization: `Bearer ${API_KEY}` };
-const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), {
-  requestInit: { headers: remoteHeaders },
-  fetch: watchedFetch,
-});
+const remoteHeaders = { ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}), "X-Psbx-Review-Wait-Sec": String(reviewWaitBudget()) };
+let connected = false;
+let connecting = null;
 // SDK 出錯（回應串流斷掉、解析不了）預設一個字都不留；寫到 stderr，client 的 MCP log 才查得到。
 remote.onerror = (err) => log("remote:", err?.message || err);
 
@@ -143,12 +146,12 @@ class CallWatch {
 // watchedFetch 是給 SDK 用的 fetch：在一次呼叫的範圍裡（callScope）發出去的請求，回應串流的每一塊都記在那次呼叫的看門狗上。
 async function watchedFetch(url, init = {}) {
   const w = callScope.getStore();
-  if (!w) return fetch(url, init);
+  if (!w) return authorizedFetch(url, init);
   w.fetches++;
   w.ended = null;
   w.lastByte = Date.now();
   const signal = init.signal ? anySignal(init.signal, w.conn.signal) : w.conn.signal;
-  const res = await fetch(url, { ...init, signal });
+  const res = await authorizedFetch(url, { ...init, signal });
   w.alive(0);
   if (!res.body || [101, 204, 205, 304].includes(res.status)) {
     w.end("closed");
@@ -193,18 +196,28 @@ function anySignal(a, b) {
 }
 
 // callWatched 呼叫一次遠端工具；結果沒回來而是看門狗判定連線沒了，回 { lost }。
-async function callWatched(name, args, timeout, onAlive) {
+async function callWatched(name, args, timeout, onAlive, signal) {
   const w = new CallWatch(onAlive);
+  const cancel = () => {
+    w.conn.abort(signal.reason);
+    w.call.abort(signal.reason);
+  };
+  if (signal?.aborted) cancel();
+  else signal?.addEventListener("abort", cancel, { once: true });
   const timer = setInterval(() => w.check(), WATCH_TICK_MS);
   try {
     const result = await callScope.run(w, () =>
-      remote.callTool({ name, arguments: args || {} }, undefined, { timeout, resetTimeoutOnProgress: true, signal: w.call.signal }));
+      remote.callTool({ name, arguments: args || {} }, undefined, {
+        timeout, resetTimeoutOnProgress: true, signal: w.call.signal,
+        onprogress: onAlive ? (progress) => onAlive(progress) : undefined,
+      }));
     return { result };
   } catch (err) {
     if (w.lost) return { lost: w.lost };
     throw err;
   } finally {
     clearInterval(timer);
+    signal?.removeEventListener("abort", cancel);
   }
 }
 
@@ -220,7 +233,7 @@ let heartbeat = null;
 // presence 打 heartbeat 或 leave；失敗不影響任何工具，回 false 就好。
 async function presence(what, timeoutMs) {
   try {
-    const res = await fetch(`${API_URL}/v1/agents/${AGENT_ID}/${what}`, {
+    const res = await authorizedFetch(`${API_URL}/v1/agents/${AGENT_ID}/${what}`, {
       method: "POST",
       headers: { ...remoteHeaders, "Content-Type": "application/json" },
       body: JSON.stringify(what === "heartbeat" ? { client: remoteHeaders["X-Psbx-Client"] || "" } : {}),
@@ -260,8 +273,17 @@ function watchForExit() {
 }
 
 async function connectRemote() {
-  await remote.connect(transport);
-  log("connected to", MCP_URL);
+  if (connected) return;
+  if (connecting) return connecting;
+  connecting = (async () => {
+    const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), { requestInit: { headers: remoteHeaders }, fetch: watchedFetch });
+    try {
+      await remote.connect(transport);
+      connected = true;
+      log("connected to", MCP_URL);
+    } catch (err) { await transport.close(); throw err; }
+  })().finally(() => { connecting = null; });
+  return connecting;
 }
 
 function textResult(text, isError = false) {
@@ -301,6 +323,8 @@ function repoName(src) {
 const STALL_MS = 120_000;
 
 async function upload(id, dest, src, list, repo = "", noDenylist = false) {
+  // A tar stream cannot be replayed after a 401. Refresh before starting it.
+  const headers = oauth ? await oauth.headers(remoteHeaders, { minValidityMs: 5 * 60_000 }) : remoteHeaders;
   // 串流上傳，不把整包 tar 讀進記憶體：真實專案很容易超過幾 GB，buffer 起來會直接 OOM。
   // COPYFILE_DISABLE=1：macOS 的 bsdtar 預設把每個檔的擴充屬性另存成 AppleDouble 成員（._foo），
   // 在 Mac 上列檔會自己合回去所以看不出來，到 Linux 箱子裡就是一堆真的垃圾檔。
@@ -342,7 +366,7 @@ async function upload(id, dest, src, list, repo = "", noDenylist = false) {
     const query = `dest=${encodeURIComponent(dest)}${repo ? `&repo=${encodeURIComponent(repo)}` : ""}`;
     response = await fetch(`${API_URL}/v1/boxes/${encodeURIComponent(id)}/sync?${query}`, {
       method: "POST",
-      headers: { ...remoteHeaders, "Content-Type": "application/gzip" },
+      headers: { ...Object.fromEntries(new Headers(headers)), "Content-Type": "application/gzip" },
       body: Readable.toWeb(tar.stdout.pipe(counter)),
       duplex: "half",
     });
@@ -686,14 +710,45 @@ async function syncFrom({ id, dest, src, given, repo, includeIgnored, commit }) 
 
 // PSBX_ADAPTER_NO_CONNECT 是給測試用的：只載入這支模組拿裡面的純函式，不連遠端、不接 stdio。
 const connect = !process.env.PSBX_ADAPTER_NO_CONNECT;
-if (connect) await connectRemote();
+if (connect && API_KEY) await connectRemote();
 
 // instructions 照 control 給的轉交：client 會放進 agent 的 system prompt（例如用完要填 sandbox_feedback）。
-const server = new Server({ name: "parallelsandbox", version: "0.1.0" }, { capabilities: { tools: {} }, instructions: connect ? remote.getInstructions() : undefined });
+const server = new Server({ name: "parallelsandbox", version: "0.4.2" }, {
+  capabilities: { tools: { listChanged: true } },
+  instructions: connected ? remote.getInstructions() : "ParallelSandbox is signing in. Call parallelsandbox_connect to get the sign-in link or check completion. After sign-in, its sandbox_* and logs_* tools become available. Give every box a goal and finish with sandbox_review or sandbox_stop.",
+});
+const connectTool = { name: "parallelsandbox_connect", description: "Connect ParallelSandbox, or check sign-in status. If sign-in is pending, show the person the returned link to sign in and allow their AI tool. Call again after they finish.", inputSchema: { type: "object", properties: {} } };
+let signingIn = null;
+function beginSignIn() {
+  if (signingIn) return;
+  connected = false;
+  signingIn = (async () => {
+    await remote.close();
+    await oauth.ensureLogin();
+    try { await connectRemote(); }
+    catch (err) {
+      if (!(err instanceof LoginRequired)) throw err;
+      // Saved credentials may have expired or been revoked since the last run.
+      await oauth.ensureLogin();
+      await connectRemote();
+    }
+    await server.sendToolListChanged().catch(() => {});
+  })().catch((err) => log(err instanceof LoginRequired ? err.message : `Connection failed: ${err.message}`))
+    .finally(() => { signingIn = null; });
+}
+server.oninitialized = () => { if (connected && oauth) server.sendToolListChanged().catch(() => {}); };
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const { tools } = await remote.listTools();
-  return { tools };
+  if (oauth && !connected) return { tools: [connectTool] };
+  if (oauth && !oauth.hasTokens()) { beginSignIn(); return { tools: [connectTool] }; }
+  try {
+    const { tools } = await remote.listTools();
+    return { tools: oauth ? [...tools, connectTool] : tools };
+  } catch (err) {
+    if (!(err instanceof LoginRequired)) throw err;
+    beginSignIn();
+    return { tools: [connectTool] };
+  }
 });
 
 // tellRemoteWhoIsCalling：把呼叫端 initialize 時報的名字轉給 control（X-Psbx-Client）。
@@ -707,43 +762,64 @@ function tellRemoteWhoIsCalling() {
 // 連線斷掉時可以直接重試的工具：只讀、或再做一次結果一樣。
 // 會改東西的（exec、sync、start、stop…）一律不重試：連線失敗不代表指令沒跑，重跑等於做兩次 build。
 const RETRY_SAFE = new Set([
-  "sandbox_status", "sandbox_list", "sandbox_get", "sandbox_versions", "sandbox_secrets", "sandbox_environments",
+  "sandbox_report", "sandbox_list", "sandbox_get", "sandbox_versions", "sandbox_secrets", "sandbox_environments",
   "logs_search", "logs_errors", "logs_tail",
 ]);
 
 // callWithRetry：連線沒了（fetch failed，或看門狗判定結果回不來）時，能重試的再試一次；不能重試的就把話講清楚，
 // 不要讓人以為「指令一定沒跑」。
-async function callWithRetry(name, args, timeout, onAlive) {
+async function callWithRetry(name, args, timeout, onAlive, signal) {
   const shotIsReadOnly = name === "sandbox_shot" && !(args || {}).record;
   const canRetry = RETRY_SAFE.has(name) || shotIsReadOnly;
   for (let attempt = 0; ; attempt++) {
     let out;
     try {
-      out = await callWatched(name, args, timeout, onAlive);
+      out = await callWatched(name, args, timeout, onAlive, signal);
     } catch (err) {
+      if (signal?.aborted) throw err;
       const msg = err?.message || String(err);
       if (!/fetch failed|socket hang up|ECONNRESET|ETIMEDOUT|EPIPE|network/i.test(msg)) throw err;
       out = { lost: msg };
     }
     if (!out.lost) return out.result;
     log(`${name}: ${out.lost}`);
+    if (signal?.aborted) throw signal.reason;
     if (canRetry && attempt === 0) continue;
+    if (name === "sandbox_review") {
+      return textResult(`${name}: the result never came back (${out.lost}). The review and feedback may still exist. Resume with the reviewId shown in progress instead of creating a new card with what. To recover a submitted report, use sandbox_report with the box id and the reportId from the app.`, true);
+    }
+    if (name === "sandbox_status") {
+      return textResult(`${name}: the result never came back (${out.lost}). This call may already have prepared pending human feedback, so it was not retried. Recover the report with sandbox_report using the box id and the reportId from the app; a repeated status call cannot replay a report already handed off.`, true);
+    }
     return textResult(`${name}: the result never came back (${out.lost}). It may have started or even finished on the box: check sandbox_status (steps[] lists what was run there) and what it should have produced before running it again.`, true);
   }
 }
 
 server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
   tellRemoteWhoIsCalling();
-  startPresence();
   const { name, arguments: args } = req.params;
-  if (name === "sandbox_sync") {
-    return sync(args);
+  if (oauth && name === "parallelsandbox_connect") {
+    if (connected && oauth.hasTokens()) return textResult("ParallelSandbox is connected. Its sandbox_* and logs_* tools are ready.");
+    beginSignIn();
+    const url = oauth.status();
+    return textResult(url ? `Sign in and allow ParallelSandbox: ${url}\nAfterwards call parallelsandbox_connect again.` : "ParallelSandbox is preparing sign-in. Call parallelsandbox_connect again shortly for the link.");
   }
-  if (name === "sandbox_pull") {
-    return pull(args);
+  if (oauth && !connected) { beginSignIn(); return textResult(new LoginRequired().message, true); }
+  startPresence();
+  try {
+    if (name === "sandbox_sync") {
+      return await sync(args);
+    }
+    if (name === "sandbox_pull") {
+      return await pull(args);
+    }
+    const timeout = name === "sandbox_takeover" || name === "sandbox_review" ? TAKEOVER_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+    return await callWithRetry(name, args, timeout, progressRelay(name, req.params._meta?.progressToken, extra), extra.signal);
+  } catch (err) {
+    if (!(err instanceof LoginRequired)) throw err;
+    beginSignIn();
+    return textResult(err.message, true);
   }
-  const timeout = name === "sandbox_takeover" ? TAKEOVER_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
-  return callWithRetry(name, args, timeout, progressRelay(name, req.params._meta?.progressToken, extra));
 });
 
 // progressRelay：control 在連線上出聲（still running）時，轉一則進度給 client。client 有給 progressToken 才轉。
@@ -752,13 +828,16 @@ function progressRelay(name, token, extra) {
   if (token === undefined) return undefined;
   const started = Date.now();
   let sent = 0;
-  return () => {
+  let progressValue = 0;
+  return (progress) => {
     const now = Date.now();
-    if (now - sent < PROGRESS_EVERY_MS) return;
+    // Preserve semantic progress, especially the review URL, after a byte heartbeat.
+    if (!progress && now - sent < PROGRESS_EVERY_MS) return;
     sent = now;
+    progressValue = Math.max(progressValue, progress?.progress ?? 0, (now - started) / 1000);
     extra.sendNotification({
       method: "notifications/progress",
-      params: { progressToken: token, progress: (now - started) / 1000, message: `${name} still running (${Math.round((now - started) / 1000)}s)` },
+      params: { ...progress, progressToken: token, progress: progressValue, message: progress?.message ?? `${name} still running (${Math.round((now - started) / 1000)}s)` },
     }).catch(() => {});
   };
 }
@@ -766,6 +845,8 @@ function progressRelay(name, token, extra) {
 if (connect) {
   watchForExit();
   await server.connect(new StdioServerTransport());
+  // Start stdio before waiting for the browser so clients' startup timers keep working.
+  if (oauth) beginSignIn();
 }
 
-export { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, startPresence, sync as syncTool, unpackDirectory, watchForExit };
+export { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, reviewWaitBudget, startPresence, sync as syncTool, unpackDirectory, watchForExit };
