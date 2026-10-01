@@ -48,7 +48,9 @@ claude mcp add --transport http parallelsandbox https://mcp.parallelsandbox.com/
 | `PSBX_TOOL_TIMEOUT_SEC` | `60` | The MCP host’s configured absolute tool deadline in seconds; used to declare a safe review wait (default 25 seconds, maximum 1800) |
 | `PSBX_ADAPTER_SILENCE_MS` | `75000` | How long a call's connection may stay silent before the adapter gives up on it (see Timeouts) |
 | `PSBX_FEEDBACK_HOST` | unset | Development feedback bridge: `claude-code` or `codex`; ordinary MCP connections remain unchanged |
-| `PSBX_CODEX_CLI` | unset | Absolute CLI path for an explicitly paired, existing official Codex App Server |
+| `PSBX_CODEX_CLI` | host `codex` process | Absolute `codex` executable used for `codex queue` feedback delivery (and for an explicitly paired App Server) |
+| `PSBX_FEEDBACK_DIR` | `~/.cache/parallelsandbox/feedback` | Feedback tickets, mailboxes and relay state |
+| `PSBX_HOOK_HOLD_SEC` | `1200` | How long Cursor's and Gemini CLI's end-of-turn hook waits right after a review is requested |
 | `PSBX_CODEX_HOST_SOCKET` | unset | Absolute path to that existing App Server's private control socket; Desktop IPC is unsupported |
 | `PSBX_CODEX_FEEDBACK_DIR` | `~/.cache/parallelsandbox/codex-feedback` | Private binding tickets shared by the Codex hook and adapter |
 
@@ -113,10 +115,42 @@ The command returns the exact session directory. Use `send --session <directory>
 runtime credentials must be available: `ANTHROPIC_API_KEY`, `CODEX_API_KEY`/`OPENAI_API_KEY`, or `GEMINI_API_KEY` with a valid provider endpoint. The runner uses a private native configuration directory; global CLI OAuth sign-in is not automatically inherited. See [SESSION_FEEDBACK.md](SESSION_FEEDBACK.md) for configuration,
 recovery and the permission profile.
 
-Registration happens when the original session is started with this runner. Adding an MCP server alone to an existing,
-unregistered private Desktop conversation does not provide a wake endpoint. This runner does not substitute another
-conversation for one it cannot control. The older experimental Claude Channel and paired Codex App Server bridges
-remain separate opt-in integrations; they are not the delivery mechanism of the registered native runner.
+Registration happens when the original session is started with this runner. The older experimental Claude Channel
+and paired Codex App Server bridges remain separate opt-in integrations; they are not the delivery mechanism of the
+registered native runner.
+
+### Feedback back to the original conversation (Codex, Claude Code, Cursor, Gemini CLI)
+
+After `sandbox_review` succeeds, App feedback for that review returns to the same conversation that asked for it.
+The adapter writes a ticket (box, review and the adapter's own agent id, no credentials) and starts one small local
+relay per account. The relay registers a feedback consumer for that conversation, claims submitted reports and hands
+the conversation a short follow-up telling it which report to read with `sandbox_report`; that read marks the App
+receipt read. Each host only differs in how the follow-up enters the conversation:
+
+| Host | Hooks | How the conversation receives it |
+|---|---|---|
+| Codex (Desktop, CLI, IDE) | none | The thread comes from Codex's tool-call metadata; the relay runs the host's own `codex queue --thread`. Idle threads start a turn; busy threads get it after the current turn. |
+| Claude Code (CLI, desktop) | `install claude-code` | A background `asyncRewake` hook wakes the idle session; a busy session reads it after its current tool call. Reopening the session hands over anything that arrived while it was closed. |
+| Cursor | `install cursor` | `afterMCPExecution` attaches the review; the `stop` hook returns it as `followup_message`. Not yet verified end to end with a real Cursor agent. |
+| Gemini CLI | `install gemini` | `AfterTool` attaches the review; the `AfterAgent` hook returns it with `decision: "block"`. |
+
+Nobody needs to set this up by hand. While a client's hooks are missing on the machine, the adapter's server
+instructions tell the AI the one command for its client (`npx -y parallelsandbox-mcp install <client>`), and the
+`sandbox_review` result says when a review is not yet routed back. The AI runs it before its first review (or runs it
+and requests that review again with `reviewId` and `waitSec: 0`). Claude Code and Cursor apply hooks added this way to
+the running conversation; Gemini CLI loads hooks when it starts, so there the first review is handed over by the next
+`sandbox_status` or `sandbox_review` on that box and later sessions are automatic. `install` merges into the client's
+user settings (Claude Code honours `CLAUDE_CONFIG_DIR`), keeps everything else and writes a `.psbx-backup` of the
+previous file. Cursor also runs Claude Code's hooks by default; the Claude Code hook acts only inside the Claude Code
+session that runs it (`CLAUDE_CODE_SESSION_ID`), so it never blocks or misroutes a Cursor conversation.
+
+Cursor and Gemini CLI have no way to wake an idle conversation. Their end-of-turn hook waits up to 20 minutes
+(`PSBX_HOOK_HOLD_SEC`) right after a review is requested, and otherwise delivers waiting feedback when that
+conversation's next turn ends.
+
+State lives in `~/.cache/parallelsandbox/feedback` (override with `PSBX_FEEDBACK_DIR`), mode 0600, for seven days.
+A report is never handed to a different conversation, never queued twice, and a hook whose host process has exited
+takes nothing. Set `PSBX_CODEX_CLI` only when the adapter cannot find its host `codex` process (for example on Windows).
 
 To wait the full 30 minutes in Codex, set `tool_timeout_sec = 1920` for this MCP server and
 `PSBX_TOOL_TIMEOUT_SEC = "1920"` in that server's adapter environment, then restart/reconnect the server using adapter

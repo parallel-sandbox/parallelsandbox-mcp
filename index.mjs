@@ -19,7 +19,14 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprot
 import { LoginRequired, OAuthSession } from "./oauth.mjs";
 import { createClaudeChannel, CLAUDE_CHANNEL_CAPABILITIES, CLAUDE_CHANNEL_INSTRUCTIONS } from "./claude-channel.mjs";
 import { createCodexFeedback } from "./codex-host.mjs";
+import { createFeedbackRoute } from "./feedback-relay.mjs";
+import { reviewInstallNote, setupInstructions } from "./feedback-install.mjs";
 import { sessionBridge } from "./session-bridge.mjs";
+
+// Subcommands share this bin: host hooks, their one-time install, and the feedback relay.
+const subcommand = process.argv[2];
+if (subcommand === "hook") process.exit(await (await import("./feedback-hook.mjs")).hookMain(process.argv.slice(2)));
+if (subcommand === "install") process.exit((await import("./feedback-install.mjs")).installMain(process.argv.slice(2)));
 
 const API_KEY = process.env.PARALLELSANDBOX_API_KEY || "";
 const MCP_URL = process.env.PARALLELSANDBOX_MCP_URL || "https://mcp.parallelsandbox.com/mcp";
@@ -85,7 +92,7 @@ const log = (...args) => console.error("[parallelsandbox-mcp]", ...args);
 const oauth = API_KEY ? null : new OAuthSession({ mcpUrl: MCP_URL, log });
 const authorizedFetch = (url, init) => oauth ? oauth.fetch(url, init) : fetch(url, init);
 
-const remote = new Client({ name: "parallelsandbox-mcp", version: "0.4.3" });
+const remote = new Client({ name: "parallelsandbox-mcp", version: "0.5.0" });
 // 同一個 headers 物件每次請求都會被讀到，所以握手拿到對方是誰之後直接塞進去。
 // 沒有這個，control 只知道「某個 API key 開了箱子」，人在 app 裡看不出是 Claude 還是 Codex 在用。
 const managedSession = sessionBridge();
@@ -727,9 +734,9 @@ if (connect && API_KEY) await connectRemote();
 const feedbackHost = process.env.PSBX_FEEDBACK_HOST || "";
 if (managedSession && feedbackHost) throw new Error("A managed session must have one feedback owner; remove PSBX_FEEDBACK_HOST");
 if (feedbackHost && !["claude-code", "codex"].includes(feedbackHost)) throw new Error("PSBX_FEEDBACK_HOST must be claude-code or codex");
-const server = new Server({ name: "parallelsandbox", version: "0.4.3" }, {
+const server = new Server({ name: "parallelsandbox", version: "0.5.0" }, {
   capabilities: { tools: { listChanged: true }, ...(feedbackHost === "claude-code" ? CLAUDE_CHANNEL_CAPABILITIES : {}) },
-  instructions: [connected ? remote.getInstructions() : "ParallelSandbox is signing in. Call parallelsandbox_connect to get the sign-in link or check completion. After sign-in, its sandbox_* and logs_* tools become available. Give every box a goal and finish with sandbox_review or sandbox_stop.", feedbackHost === "claude-code" ? CLAUDE_CHANNEL_INSTRUCTIONS : ""].filter(Boolean).join("\n\n"),
+  instructions: [connected ? remote.getInstructions() : "ParallelSandbox is signing in. Call parallelsandbox_connect to get the sign-in link or check completion. After sign-in, its sandbox_* and logs_* tools become available. Give every box a goal and finish with sandbox_review or sandbox_stop.", feedbackHost === "claude-code" ? CLAUDE_CHANNEL_INSTRUCTIONS : "", !managedSession && !feedbackHost ? setupInstructions() : ""].filter(Boolean).join("\n\n"),
 });
 claudeChannel = feedbackHost === "claude-code" ? createClaudeChannel({server, authorizedFetch, apiUrl: API_URL, headers: remoteHeaders, consumerId: AGENT_ID}) : null;
 codexFeedback = feedbackHost === "codex" ? createCodexFeedback({
@@ -739,6 +746,10 @@ codexFeedback = feedbackHost === "codex" ? createCodexFeedback({
   cliPath: process.env.PSBX_CODEX_CLI,
   callRemoteReport: ({id, reportId, signal}) => callWithRetry("sandbox_report", {id, reportId}, DEFAULT_TIMEOUT_MS, undefined, signal),
   onState: (state) => log("feedback:", state),
+}) : null;
+// App feedback back to the conversation that asked for the review (see feedback-relay.mjs).
+const feedbackRoute = connect && !managedSession && !feedbackHost ? createFeedbackRoute({
+  apiUrl: API_URL, mcpUrl: MCP_URL, agentId: AGENT_ID, authorizedFetch, headers: remoteHeaders, log,
 }) : null;
 const connectTool = { name: "parallelsandbox_connect", description: "Connect ParallelSandbox, or check sign-in status. If sign-in is pending, show the person the returned link to sign in and allow their AI tool. Call again after they finish.", inputSchema: { type: "object", properties: {} } };
 let signingIn = null;
@@ -764,6 +775,12 @@ server.oninitialized = () => {
   if (connect) {
     claudeChannel?.startHandshake().catch((err) => log("channel:", err?.message || err));
     Promise.resolve(codexFeedback?.start()).catch((err) => log("feedback:", err?.message || err));
+    if (feedbackRoute) {
+      // A relay that crashed while this host stays open comes back within a minute.
+      const resume = () => feedbackRoute.resumeRelay().catch((err) => log("feedback relay:", err?.message || err));
+      resume();
+      setInterval(resume, 60_000).unref();
+    }
   }
 };
 
@@ -864,6 +881,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
           if (claudeBinding && !claudeBinding.bound) {
             result.content = [...(result.content || []), {type: "text", text: JSON.stringify({automaticFeedback: {host: "claude-code", registered: false, reason: claudeBinding.reason || "unavailable"}, note: "The review card was created. Native event activation alone does not verify routing to the original session. The saved report remains available through sandbox_report."})}];
           }
+          if (feedbackRoute) {
+            const route = await feedbackRoute.trackReview({boxId: args.id, reviewId: payload.reviewId, clientName: server.getClientVersion?.()?.name, meta: req.params._meta});
+            const missing = reviewInstallNote(server.getClientVersion?.()?.name, {id: args.id, reviewId: payload.reviewId});
+            const automatic = route.automatic === true || (route.automatic && !missing);
+            result.content = [...(result.content || []), {type: "text", text: automatic
+              ? "App feedback for this review returns to this same conversation as a follow-up message. You may finish your turn; the follow-up tells you which report to read with sandbox_report."
+              : missing || "Automatic delivery to this conversation is not available; read a submitted report with sandbox_report."}];
+          }
           const tracked = await codexFeedback?.trackReview({boxId: args.id, reviewId: payload.reviewId});
           if (tracked?.hookMeta) result._meta = {...result._meta, psbxCodexFeedback: tracked.hookMeta};
           if (codexFeedback && !tracked?.supported) {
@@ -879,6 +904,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     }
     try {
       await claudeChannel?.onToolResult(name, args || {}, result);
+      if (feedbackRoute && name === "sandbox_report" && !result?.isError && args?.reportId) {
+        await feedbackRoute.onReportRead({boxId: args.id, reportId: args.reportId}).catch((error) => log("feedback read:", error.message));
+      }
       if (managedSession && name === "sandbox_report" && !result?.isError) {
         // Only the complete successful native tool result acknowledges this read.
         // Ordinary report replay outside a dispatched turn need not register one.

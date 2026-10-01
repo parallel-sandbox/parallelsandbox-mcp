@@ -427,7 +427,7 @@ export class SessionHost {
   }
 
   async readReport(event) {
-    this.remote ||= new Client({name: "parallelsandbox-feedback-host", version: "0.4.3"});
+    this.remote ||= new Client({name: "parallelsandbox-feedback-host", version: "0.5.0"});
     if (!this.remoteConnected) {
       const transport = new StreamableHTTPClientTransport(new URL(this.config.mcpUrl), {
         requestInit: {headers: this.headers}, fetch: (url, init) => this.fetch(url, init),

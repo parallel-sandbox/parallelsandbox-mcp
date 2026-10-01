@@ -8,6 +8,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { mkdtempSync as mkdtempFeedback, rmSync as rmFeedback } from "node:fs";
+import { after as afterAllFeedback } from "node:test";
+const feedbackDir = mkdtempFeedback(join(tmpdir(), "psbx-adapter-feedback-"));
+afterAllFeedback(() => rmFeedback(feedbackDir, { recursive: true, force: true }));
 
 async function adapterFixture(host, env = {}) {
   const requests = [];
@@ -37,7 +41,7 @@ async function adapterFixture(host, env = {}) {
   const child = spawn(process.execPath, ["index.mjs"], {
     cwd: dirname(fileURLToPath(import.meta.url)),
     env: {...process.env, PARALLELSANDBOX_API_KEY: "unit-key", PARALLELSANDBOX_MCP_URL: `${base}/mcp`, PARALLELSANDBOX_API_URL: base,
-      PSBX_ADAPTER_NO_CONNECT: "", PSBX_FEEDBACK_HOST: host || "", PSBX_CODEX_HOST_SOCKET: "", ...env},
+      PSBX_ADAPTER_NO_CONNECT: "", PSBX_FEEDBACK_HOST: host || "", PSBX_CODEX_HOST_SOCKET: "", PSBX_FEEDBACK_DIR: feedbackDir, ...env},
     stdio: ["pipe", "pipe", "pipe"],
   });
   const replies = new Map();

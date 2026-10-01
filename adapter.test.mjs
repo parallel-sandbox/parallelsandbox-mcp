@@ -7,6 +7,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { mkdtempSync as mkdtempFeedback, rmSync as rmFeedback } from "node:fs";
+import { tmpdir as feedbackTmp } from "node:os";
+import { after as afterAllFeedback } from "node:test";
+// Adapter runs write feedback tickets and start a relay; keep both out of the real home directory.
+const feedbackDir = mkdtempFeedback(`${feedbackTmp()}/psbx-adapter-feedback-`);
+afterAllFeedback(() => rmFeedback(feedbackDir, { recursive: true, force: true }));
 
 // 假的 control：只記下 adapter 打來的請求（心跳、離開、sync 上傳的那包 tar.gz）。
 const seen = [];
@@ -381,6 +387,7 @@ async function adapterClient(env = {}) {
       PARALLELSANDBOX_API_URL: process.env.PARALLELSANDBOX_API_URL,
       PARALLELSANDBOX_MCP_URL: `http://127.0.0.1:${mcp.address().port}/mcp`,
       PSBX_ADAPTER_SILENCE_MS: "1500",
+      PSBX_FEEDBACK_DIR: feedbackDir,
       ...env,
     },
     stderr: "ignore",

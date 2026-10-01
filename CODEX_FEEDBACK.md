@@ -1,6 +1,9 @@
 # Codex feedback bridge: development integration
 
-This is development integration for the **unpublished 0.4.3 checkout**; the published 0.4.2 package does not include these bridge files. It targets an **already-running, explicitly paired official Codex App Server** that has the original thread loaded. The current Codex Desktop installation uses private stdio and has no documented control endpoint for this bridge, so it is currently unsupported.
+> The default Codex route is now `codex queue` (see README, "Feedback back to the original conversation"): it needs no socket, hook or
+> pairing, and works for Codex Desktop conversations. This App Server bridge stays an explicit opt-in experiment.
+
+This development integration ships in the package since 0.4.3; 0.4.2 and earlier do not include these bridge files. It targets an **already-running, explicitly paired official Codex App Server** that has the original thread loaded. The current Codex Desktop installation uses private stdio and has no documented control endpoint for this bridge, so it is currently unsupported.
 
 The bridge's unit and protocol tests run in a real ParallelSandbox box. Real Codex idle/active turn delivery, the installed runtime's hook `_meta` passthrough, and approval routing back to its existing UI are **pending integration verification**. The protocol fixtures are not evidence of real model execution.
 

@@ -1,5 +1,8 @@
 # Claude Code native feedback channel
 
+> Claude Code feedback delivery now uses an `asyncRewake` hook (README, "Feedback back to the original conversation";
+> `npx -y parallelsandbox-mcp install claude-code`). This channel experiment is unchanged and not needed for it.
+
 This development integration does not currently support automatic Claude feedback routing. Its isolated protocol tests pass; authenticated native idle wake-up and native queue isolation across `/clear` or `/resume` have not been verified. The current adapter therefore refuses feedback binding and polling, including after a successful channel activation challenge. Saved reports remain readable with `sandbox_report`. The integration does not open another conversation, run a headless `--resume`, or keep an AI tool call waiting to imitate a wake-up.
 
 The plugin's MCP process starts automatically when Claude loads the plugin. During Claude's channels research preview, installing an MCP server or plugin alone does not activate inbound events. ParallelSandbox is a custom channel and requires explicit startup opt-in and Claude's development-channel confirmation:
