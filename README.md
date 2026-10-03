@@ -135,9 +135,10 @@ receipt read. Each host only differs in how the follow-up enters the conversatio
 | Gemini CLI | `install gemini` | `AfterTool` attaches the review; the `AfterAgent` hook returns it with `decision: "block"`. |
 
 Nobody needs to set this up by hand. While a client's hooks are missing on the machine, the adapter's server
-instructions tell the AI the one command for its client (`npx -y parallelsandbox-mcp install <client>`), and the
-`sandbox_review` result says when a review is not yet routed back. The AI runs it before its first review (or runs it
-and requests that review again with `reviewId` and `waitSec: 0`). Claude Code and Cursor apply hooks added this way to
+instructions tell the AI to ask the person, in the conversation, for consent to run the one command for its client
+(`npx -y parallelsandbox-mcp install <client>`; it changes their user settings), and the `sandbox_review` result says when
+a review is not yet routed back. Once the person agrees, the AI runs it before its first review (or runs it and requests
+that review again with `reviewId` and `waitSec: 0`). Claude Code and Cursor apply hooks added this way to
 the running conversation; Gemini CLI loads hooks when it starts, so there the first review is handed over by the next
 `sandbox_status` or `sandbox_review` on that box and later sessions are automatic. `install` merges into the client's
 user settings (Claude Code honours `CLAUDE_CONFIG_DIR`), keeps everything else and writes a `.psbx-backup` of the

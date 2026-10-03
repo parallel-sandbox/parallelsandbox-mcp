@@ -106,7 +106,7 @@ export function installNote(clientName, opts = {}) {
   const command = `${DEFAULT_COMMAND} install ${host}`;
   return {
     host, installed: false, command,
-    usage: `ParallelSandbox setup step for this conversation (not done yet): App feedback returns to this conversation only after ParallelSandbox's ${host} hooks are installed. Run this command once now: ${command}\nIt only adds ParallelSandbox's hooks to the user settings and can be run again safely.`,
+    usage: `ParallelSandbox setup step for this conversation (not done yet): App feedback returns to this conversation only after ParallelSandbox's ${host} hooks are in the person's user settings. Changing their settings needs their consent, so ask them now, in this conversation, whether you may run this once: ${command}\nIt only adds ParallelSandbox's hooks to those settings, keeps a backup of the previous file and can be run again safely.`,
   };
 }
 
@@ -116,7 +116,7 @@ export function reviewInstallNote(clientName, { id, reviewId }, opts = {}) {
   const note = installNote(clientName, opts);
   if (!note) return null;
   if (note.host === "gemini") return `${note.usage}\nGemini CLI loads hooks when it starts, so feedback for this review is not routed automatically in this run: sandbox_status or sandbox_review for box ${id} hands a submitted report to you. Reviews requested after Gemini CLI restarts return automatically.`;
-  return `${note.usage}\nThen call sandbox_review with ${JSON.stringify({ id, reviewId, waitSec: 0 })} once so this review's feedback returns here. Until then, read submitted reports with sandbox_report.`;
+  return `${note.usage}\nOnce the person agrees and it is installed, call sandbox_review with ${JSON.stringify({ id, reviewId, waitSec: 0 })} once so this review's feedback returns here. Until then, read submitted reports with sandbox_report.`;
 }
 
 // Server instructions (system prompt level) for hosts whose hooks are missing on this machine.
@@ -125,8 +125,8 @@ export function setupInstructions(opts = {}) {
   if (!missing.length) return "";
   const names = { "claude-code": "Claude Code", cursor: "Cursor", gemini: "Gemini CLI" };
   return [
-    "App feedback setup: when the person submits feedback in the ParallelSandbox App, it returns to the conversation that requested the review. Codex needs nothing. In the following clients it needs ParallelSandbox's hooks, installed once per machine by running the command for the client you are running in before your first sandbox_review:",
+    "App feedback setup: when the person submits feedback in the ParallelSandbox App, it returns to the conversation that requested the review. Codex needs nothing. The following clients need ParallelSandbox's hooks in the person's user settings, once per machine. Changing their settings needs their consent: before your first sandbox_review, ask the person in this conversation whether you may run the command for the client you are running in:",
     ...missing.map((h) => `- ${names[h]}: ${DEFAULT_COMMAND} install ${h}`),
-    "The command only adds ParallelSandbox's hooks to that client's user settings and can be run again safely. Claude Code and Cursor apply them to the running conversation; Gemini CLI applies them from its next start.",
+    "The command only adds ParallelSandbox's hooks to that client's user settings, keeps a backup of the previous file and can be run again safely. Claude Code and Cursor apply them to the running conversation; Gemini CLI applies them from its next start.",
   ].join("\n");
 }

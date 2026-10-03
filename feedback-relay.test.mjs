@@ -205,7 +205,7 @@ test("usage note appears only for a hook host without hooks, and disappears afte
   assert.equal(installNote("codex-mcp-client", { home, env }), null);
   assert.equal(installNote("unknown", { home, env }), null);
   const note = installNote("claude-code", { home, env });
-  assert.match(note.usage, /Run this command once now: .*install claude-code/);
+  assert.match(note.usage, /ask them now, in this conversation, whether you may run this once: .*install claude-code/);
   assert.match(reviewInstallNote("claude-code", { id: "b1", reviewId: "r1" }, { home, env }), /sandbox_review with \{"id":"b1","reviewId":"r1","waitSec":0\}/);
   install("claude-code", { home, env, command: "psbx" });
   assert.ok(existsSync(join(home, "cfg", "settings.json")), "CLAUDE_CONFIG_DIR is honored");
