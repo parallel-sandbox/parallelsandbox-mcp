@@ -1,7 +1,7 @@
 // 同步挑檔的規則錯了就是「箱子裡少東西」或「上傳幾 GB」，兩種都很難查，所以這幾個純函式要有測試。
 import { strict as assert } from "node:assert";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { createReadStream, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { createReadStream, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,11 +16,15 @@ afterAllFeedback(() => rmFeedback(feedbackDir, { recursive: true, force: true })
 
 // 假的 control：記下 adapter 打來的請求（心跳、離開、sync 上傳的那包 tar.gz）。
 // sync 上傳的那包照 boxd 的樣子解進假的 /work（fakeWork/<dest>，合併在原有的東西上），回 changed；
-// dest 在 failDests 裡的回 409，像凍住的箱子。fullOutputs 是假的 exec 完整輸出網址（outputUrl）。
+// dest 在 failDests 裡的回 409，像凍住的箱子；在 failOnce 裡的第一次回那個狀態碼；在 slowAnswer 裡的收完整包後很久才回。
+// fullOutputs 是假的 exec 完整輸出網址（outputUrl）；downloads 是假的預簽下載網址，值是依序回的 { status, body }。
 const seen = [];
 const fakeWork = mkdtempSync(join(tmpdir(), "psbx-fakework-"));
 const failDests = new Set();
+const failOnce = new Map();
+const slowAnswer = new Set();
 const fullOutputs = new Map();
+const downloads = new Map();
 const api = createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
@@ -32,12 +36,33 @@ const api = createServer((req, res) => {
       res.end(fullOutputs.get(req.url));
       return;
     }
+    if (downloads.has(req.url)) {
+      const queue = downloads.get(req.url);
+      const next = queue.length > 1 ? queue.shift() : queue[0];
+      res.writeHead(next.status, { "Content-Type": "application/octet-stream" });
+      res.end(next.body || "");
+      return;
+    }
     const sync = req.url.match(/^\/v1\/boxes\/[^/]+\/sync\?dest=([^&]*)/);
     if (sync) {
       const dest = decodeURIComponent(sync[1]);
       if (failDests.has(dest)) {
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end('{"error":"box frozen"}');
+        return;
+      }
+      if (failOnce.has(dest)) {
+        const status = failOnce.get(dest);
+        failOnce.delete(dest);
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end('{"error":"bad gateway"}');
+        return;
+      }
+      if (slowAnswer.has(dest)) {
+        setTimeout(() => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end('{"ok":true}');
+        }, 5_000).unref();
         return;
       }
       const into = join(fakeWork, dest);
@@ -57,10 +82,12 @@ api.unref();
 
 // import 會在檔案最上面的賦值之前就執行，所以環境變數要在動態載入前設好。
 process.env.PSBX_ADAPTER_NO_CONNECT = "1";
+// 進度每 200 毫秒報一次（SILENCE_MS / 3），整包送完等回答的上限 1.5 秒：測試不用等真的 10 秒、10 分鐘。
+process.env.PSBX_ADAPTER_SILENCE_MS = "600";
+process.env.PSBX_ADAPTER_ANSWER_MS = "1500";
 process.env.PARALLELSANDBOX_API_KEY = process.env.PARALLELSANDBOX_API_KEY || "test-key";
 process.env.PARALLELSANDBOX_API_URL = `http://127.0.0.1:${api.address().port}`;
-const { AGENT_ID, archiveCommit, baselineDest, boxRel, copyInto, gitFileList, ignoredTopLevel, presence, repoName, reviewWaitBudget, setBoxExecForTest,
-  staleEntries, staleSyncWarning, syncTool, unpackDirectory, workRel } = await import("./index.mjs");
+const { AGENT_ID, archiveCommit, baselineDest, boxRel, copyInto, gitFileList, globMatcher, ignoredTopLevel, localTool, matchStartedBox, networkCode, networkFailure, presence, pullTool, repoName, reviewWaitBudget, setBoxExecForTest, setBoxGetForTest, staleEntries, staleSyncWarning, syncTool, toolsHash, unpackDirectory, workRel } = await import("./index.mjs");
 
 // 假的 sandbox_exec：指令在本機跑，/work 換成 fakeWork。比對、刪檔、看 dest 是不是資料夾都走這裡。
 const execs = [];
@@ -89,7 +116,7 @@ function repo() {
 test("被忽略而沒送過去的頂層名字要講出來，不能默默跳過", () => {
   const { dir } = repo();
   try {
-    assert.deepEqual(ignoredTopLevel(dir), { skipped: ["dist"], partiallyIgnored: [] });
+    assert.deepEqual(ignoredTopLevel(dir), { skipped: ["dist"], partiallyIgnored: [], configs: [] });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -358,6 +385,8 @@ test("收到 SIGTERM：先打 leave 再結束", () => childLeaves((c) => c.kill(
 // 實際發生過：control 在第 363 秒把結果送完了，adapter 裡的 SDK 把它弄丟，呼叫一直掛到 Claude Code 30 分鐘砍掉。
 const mcpCalls = [];
 const hanging = new Set();
+// fakeTools 是假 control 的工具清單；測試改它，模擬 control 上版後 schema 變了。
+let fakeTools = [{ name: "sandbox_start", description: "start", inputSchema: { type: "object", properties: {} } }];
 const mcp = createServer((req, res) => {
   if (req.method !== "POST") {
     res.writeHead(405).end();
@@ -377,8 +406,13 @@ const mcp = createServer((req, res) => {
       res.end(JSON.stringify(reply({ protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake-control", version: "1" } })));
       return;
     }
+    if (msg.method === "tools/list") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(reply({ tools: fakeTools })));
+      return;
+    }
     const name = msg.params?.name;
-    const call = { name, closed: false, reviewBudget: req.headers["x-psbx-review-wait-sec"] };
+    const call = { name, closed: false, reviewBudget: req.headers["x-psbx-review-wait-sec"], toolBudget: req.headers["x-psbx-tool-wait-sec"], args: msg.params?.arguments };
     mcpCalls.push(call);
     req.socket.on("close", () => (call.closed = true));
     // control 的驗證上游出事：還沒進到工具就回 503（auth_blip 前兩次、auth_down 一直、lb_down 是 ALB 的 HTML）。
@@ -396,6 +430,19 @@ const mcp = createServer((req, res) => {
       res.end(JSON.stringify(body));
       return;
     }
+    // 短的呼叫 control 直接回整包 JSON：送到一半連線被切，Node 的 fetch 讀 body 時丟「terminated」。
+    // sandbox_shot 第一次被切、第二次正常；cuts_json 每次都被切。
+    if ((name === "sandbox_shot" && seenTimes === 1) || name === "cuts_json") {
+      res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "5000" });
+      res.write(`{"jsonrpc":"2.0","id":${JSON.stringify(msg.id)},"result":{"content":[{"type":"text","text":"`);
+      setTimeout(() => res.destroy(), 50);
+      return;
+    }
+    if (name === "sandbox_shot") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(reply({ content: [{ type: "text", text: "sandbox_shot done" }] })));
+      return;
+    }
     // control 的 keepAlive：20 秒後把回應升級成 SSE，之後定時送一則 still running。
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
     const event = (m) => res.write(`event: message\ndata: ${JSON.stringify(m)}\n\n`);
@@ -405,7 +452,7 @@ const mcp = createServer((req, res) => {
     const tries = mcpCalls.filter((c) => c.name === name).length;
     if (name === "ends_early" || (name === "sandbox_report" && tries === 1) || name === "sandbox_status") {
       res.end(); // 串流結束了，結果沒來
-    } else if (name === "goes_silent") {
+    } else if (name === "goes_silent" || (name === "sandbox_exec" && msg.params.arguments?.cmd === "silent")) {
       hanging.add(res); // 連線還在，一個位元組都不再來
     } else {
       if (name === "sandbox_review" && msg.params._meta?.progressToken !== undefined) {
@@ -482,6 +529,62 @@ test("連線一直開著卻沒有任何位元組：過了靜默上限就切掉�
   }
 });
 
+test("前景 exec 的結果在路上斷了：回事先給的 execId，叫 agent 用 sandbox_procs wait 取結果，不要重跑", async () => {
+  const client = await adapterClient();
+  try {
+    const out = await client.callTool({ name: "sandbox_exec", arguments: { id: "box-1", cmd: "silent", note: "n" } });
+    assert.equal(out.isError, true);
+    const call = mcpCalls.findLast((c) => c.name === "sandbox_exec" && c.args?.cmd === "silent");
+    assert.match(call.args.execId, /^[0-9a-f]{16}$/, "前景 exec 要事先帶 execId 給 control");
+    const text = out.content[0].text;
+    assert.ok(text.includes(`"action": "wait", "bgId": "${call.args.execId}"`), text);
+    assert.match(text, /keeps running on the box.*Do not run it again/s);
+  } finally {
+    for (const res of hanging) res.destroy();
+    await client.close();
+  }
+});
+
+test("背景 exec 不帶 execId（它自己有 bgId）", async () => {
+  const client = await adapterClient();
+  try {
+    await client.callTool({ name: "sandbox_exec", arguments: { id: "box-1", cmd: "sleep 1", note: "n", background: true } });
+    const call = mcpCalls.findLast((c) => c.name === "sandbox_exec" && c.args?.background);
+    assert.equal(call.args.execId, undefined);
+  } finally {
+    await client.close();
+  }
+});
+
+test("control 的工具清單改版：送 tools/list_changed 叫 client 重抓", async () => {
+  const { ToolListChangedNotificationSchema } = await import("@modelcontextprotocol/sdk/types.js");
+  const client = await adapterClient({ PSBX_ADAPTER_TOOLS_CHECK_MS: "200" });
+  try {
+    let changed = 0;
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () => { changed++; });
+    const first = await client.listTools();
+    assert.ok(first.tools.some((t) => t.name === "sandbox_start"));
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(changed, 0, "沒改版就不通知");
+    fakeTools = [{ name: "sandbox_start", description: "start", inputSchema: { type: "object", required: ["goal"], properties: { goal: { type: "string" } } } }];
+    const deadline = Date.now() + 3000;
+    while (changed === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(changed, 1, "改版要通知一次");
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(changed, 1, "同一次改版不重複通知");
+  } finally {
+    await client.close();
+  }
+});
+
+test("連線錯誤講清楚斷在哪一段與原因（err.cause）", () => {
+  const err = new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND mcp.parallelsandbox.com"), { code: "ENOTFOUND" }) });
+  const text = networkFailure(err);
+  assert.match(text, /^connection from this computer to ParallelSandbox \(.+\) failed: fetch failed \(ENOTFOUND: getaddrinfo ENOTFOUND mcp\.parallelsandbox\.com\)$/);
+  assert.match(networkFailure(new Error("socket hang up")), /failed: socket hang up$/);
+  assert.notEqual(toolsHash([{ name: "a" }]), toolsHash([{ name: "a", inputSchema: { required: ["goal"] } }]));
+});
+
 test("control 一直出聲的長呼叫照常拿到結果，進度轉給 client", async () => {
   const client = await adapterClient();
   try {
@@ -503,6 +606,23 @@ test("持久 report 重讀的結果弄丟了就自己重試一次", async () => 
     const out = await client.callTool({ name: "sandbox_report", arguments: { id: "box-1", reportId: "report-1" } });
     assert.equal(out.content[0].text, "sandbox_report done");
     assert.equal(mcpCalls.filter((c) => c.name === "sandbox_report").length, 2);
+  } finally {
+    await client.close();
+  }
+});
+
+test("回應送到一半被切（terminated）：唯讀的截圖自己重試一次；會改東西的講清楚可能已經跑了", async () => {
+  const client = await adapterClient();
+  try {
+    const shot = await client.callTool({ name: "sandbox_shot", arguments: { id: "box-1" } });
+    assert.equal(shot.isError, undefined, JSON.stringify(shot));
+    assert.equal(shot.content[0].text, "sandbox_shot done");
+    assert.equal(mcpCalls.filter((c) => c.name === "sandbox_shot").length, 2, "被切一次就重試一次");
+
+    const cut = await client.callTool({ name: "cuts_json", arguments: {} });
+    assert.equal(cut.isError, true);
+    assert.match(cut.content[0].text, /never came back \(connection from this computer to ParallelSandbox .* failed: terminated.*sandbox_status/s);
+    assert.equal(mcpCalls.filter((c) => c.name === "cuts_json").length, 1, "不能重試的不重跑");
   } finally {
     await client.close();
   }
@@ -566,6 +686,7 @@ test("review transport declares the real host budget for both default and config
    const out = await client.callTool({name:"sandbox_review",arguments:{reviewId:"budget-round"}});
    assert.equal(out.isError,undefined);
    assert.equal(mcpCalls.findLast(c=>c.name==="sandbox_review").reviewBudget,want);
+   assert.equal(mcpCalls.findLast(c=>c.name==="sandbox_review").toolBudget,want);
   } finally {await client.close();}
  }
 });
@@ -756,7 +877,7 @@ test("sync 回傳列出送了哪些檔、箱子改了幾個；改到 package.jso
     let out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "sent" }));
     assert.deepEqual(out.sentPaths.sort(), [".gitignore", "main.go", "package.json"]);
     assert.equal(out.changedOnBox, 3);
-    assert.equal(out.notes, undefined, "新的 dest 沒有開著的 dev server，不用提醒");
+    assert.ok(!(out.notes || []).some((n) => /dev server/.test(n)), "新的 dest 沒有開著的 dev server，不用提醒");
 
     writeFileSync(join(dir, "package.json"), '{"name":"x"}\n');
     out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "sent" }));
@@ -919,6 +1040,349 @@ test("sandbox_pull 解資料夾時回寫了哪些檔", async () => {
     const files = await unpackDirectory(createReadStream(archive), join(dir, "local"));
     assert.deepEqual(files.sort(), ["assets/a.js", "index.html"]);
     assert.ok(lstatSync(join(dir, "local", "assets", "a.js")).isFile());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+// sandbox_start 的結果沒回來（或被 host 切掉）：照 sandbox_list 找這個對話剛用同一個名字與目的開的箱子。
+test("a lost sandbox_start is matched to the box this conversation just created", () => {
+  const since = Date.parse("2026-10-06T01:00:00Z");
+  const list = { boxes: [
+    { id: "old", name: "退款流程", goal: "驗退款", agent: { thisConversation: true }, createdAt: "2026-10-06T00:30:00Z", status: "ready" },
+    { id: "other", name: "退款流程", goal: "驗退款", agent: { thisConversation: false }, createdAt: "2026-10-06T01:00:05Z", status: "ready" },
+    { id: "mine", name: "退款流程", goal: "驗退款", agent: { thisConversation: true }, createdAt: "2026-10-06T01:00:04Z", status: "claimed" },
+    { id: "diffgoal", name: "退款流程", goal: "別的", agent: { thisConversation: true }, createdAt: "2026-10-06T01:00:06Z", status: "ready" },
+  ] };
+  assert.equal(matchStartedBox(list, { name: " 退款流程\n", goal: "驗退款 " }, since)?.id, "mine");
+  assert.equal(matchStartedBox(list, { name: "退款流程", goal: "驗退款" }, since).id, "mine");
+  assert.equal(matchStartedBox(list, { name: "沒有這個", goal: "驗退款" }, since), null);
+  assert.equal(matchStartedBox({}, { name: "x", goal: "y" }, since), null);
+});
+
+// 連線還沒建立就失敗（DNS、拒絕連線）：碼在 fetch 錯誤的 cause 裡，這種請求沒送出去，可以安全重試。
+test("network errors before the request is sent are recognised from the cause chain", () => {
+  const dns = new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND mcp.parallelsandbox.com"), { code: "ENOTFOUND" }) });
+  assert.equal(networkCode(dns), "ENOTFOUND");
+  const reset = new TypeError("fetch failed", { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+  assert.equal(networkCode(reset), "");
+  assert.equal(networkCode(new Error("boom")), "");
+});
+
+const restoreExec = () => setBoxExecForTest(async (args) => ({ content: [{ type: "text", text: JSON.stringify(localExec(args)) }] }));
+const apiURL = (path) => `${process.env.PARALLELSANDBOX_API_URL}${path}`;
+
+// 使用回饋：只改一支 .mjs，再 sync 一次仍重傳整個 15.9 MB 的資料夾（不是 git 的資料夾以前整包送）。
+test("不是 git 的資料夾也只送有變的檔，略過的黑名單名字照實列出", async () => {
+  const plain = mkdtempSync(join(tmpdir(), "psbx-plain-sync-"));
+  try {
+    writeFileSync(join(plain, "a.mjs"), "a\n");
+    writeFileSync(join(plain, "b.mjs"), "b\n");
+    mkdirSync(join(plain, "node_modules", "x"), { recursive: true });
+    writeFileSync(join(plain, "node_modules", "x", "i.js"), "x\n");
+    let out = parsed(await syncTool({ id: "bx", localPath: plain, dest: "plain-delta" }));
+    assert.equal(out.sentFiles, 2);
+    assert.deepEqual(out.skipped, ["node_modules"]);
+    assert.ok(existsSync(boxFile("plain-delta/a.mjs")));
+    writeFileSync(join(plain, "b.mjs"), "b2\n");
+    out = parsed(await syncTool({ id: "bx", localPath: plain, dest: "plain-delta" }));
+    assert.deepEqual(out.sentPaths, ["b.mjs"]);
+    assert.deepEqual(tarNames(uploadsTo("plain-delta").at(-1).raw), ["b.mjs"]);
+    assert.equal(readFileSync(boxFile("plain-delta/b.mjs"), "utf8"), "b2\n");
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test("exclude 的 glob：沒有 / 的比任何一層的名字，有 / 的從 localPath 算起，比到資料夾就整個擋", () => {
+  const m = globMatcher(["*.log", "android/app/build.gradle", "/dist", "renderer/dist-win/**", "a?c", "cache/"]);
+  assert.ok(m("x/y/z.log"));
+  assert.ok(m("android/app/build.gradle"));
+  assert.ok(!m("x/android/app/build.gradle"), "有 / 的從 localPath 算起");
+  assert.ok(m("dist/a.js"));
+  assert.ok(!m("src/dist/a.js"));
+  assert.ok(m("renderer/dist-win/x/setup.exe"));
+  assert.ok(m("abc") && !m("abbc"));
+  assert.ok(m("deep/cache/x.bin"), "沒有 / 的資料夾名字，任何一層都擋");
+  assert.ok(!m("src/main.ts"));
+  assert.equal(globMatcher([]), null);
+});
+
+// 使用回饋：sync 把本機的 capacitor.config.ts 蓋回箱子，覆寫了為 debug APK 改的 url，每次 sync 完都要重新 sed。
+test("exclude：比到的檔不送也不比，箱子裡那份不算多出來，prune 也不刪", async () => {
+  const { dir, git } = repo();
+  try {
+    writeFileSync(join(dir, "capacitor.config.ts"), "url: prod\n");
+    mkdirSync(join(dir, "big"));
+    writeFileSync(join(dir, "big", "x.bin"), "x\n");
+    git("add", "-A");
+    git("commit", "-qm", "cap");
+    assert.equal(parsed(await syncTool({ id: "bx", localPath: dir, dest: "excl" })).ok, true);
+    writeFileSync(boxFile("excl/capacitor.config.ts"), "url: http://localhost:5173/\n");
+    writeFileSync(join(dir, "capacitor.config.ts"), "url: prod2\n");
+    rmSync(join(dir, "big"), { recursive: true });
+    git("add", "-A");
+    git("commit", "-qm", "rm big");
+    const out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "excl", exclude: ["capacitor.config.ts", "big/"], prune: true }));
+    assert.equal(readFileSync(boxFile("excl/capacitor.config.ts"), "utf8"), "url: http://localhost:5173/\n", "箱子裡改過的那份要留著");
+    assert.ok(existsSync(boxFile("excl/big/x.bin")), "exclude 擋下的不刪");
+    assert.deepEqual(out.excluded, { count: 1, paths: ["capacitor.config.ts"] });
+    assert.equal(out.staleInDest, undefined);
+    assert.ok(!out.sentPaths.includes("capacitor.config.ts"));
+    const bad = await syncTool({ id: "bx", localPath: dir, dest: "excl", exclude: "capacitor.config.ts" });
+    assert.equal(bad.isError, true);
+    assert.match(bad.content[0].text, /exclude takes an array/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：沒被 .gitignore 的 dist-win（191.6 MB）整包送進去，只能中止後縮小範圍。
+test("要送的超過 maxMB 就不送，講最大的資料夾；dryRun 只列出會送什麼", async () => {
+  const { dir } = repo();
+  try {
+    mkdirSync(join(dir, "app", "dist-win"), { recursive: true });
+    writeFileSync(join(dir, "app", "dist-win", "setup.exe"), Buffer.alloc(3 * 1024 * 1024, 1));
+    writeFileSync(join(dir, "app", "main.ts"), "x\n");
+    const before = uploadsTo("big").length;
+    let res = await syncTool({ id: "bx", localPath: dir, dest: "big", maxMB: 2 });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /over the 2\.0 MB limit/);
+    assert.match(res.content[0].text, /app\/ 3\.0 MB in 2 files \(app\/dist-win\/ 3\.0 MB\)/);
+    assert.match(res.content[0].text, /maxMB: 4/);
+    assert.match(res.content[0].text, /NOT SYNCED/);
+    assert.equal(uploadsTo("big").length, before, "超過上限什麼都不送");
+
+    res = await syncTool({ id: "bx", localPath: dir, dest: "big", maxMB: 2, dryRun: true });
+    assert.equal(res.isError, false, res.content[0].text);
+    const out = parsed(res);
+    assert.equal(out.dryRun, true);
+    assert.equal(out.sentFiles, 4);
+    assert.equal(out.sendMB, 3);
+    assert.equal(out.largest[0].path, "app/");
+    assert.ok(out.notes.some((n) => /dryRun: nothing was sent.*refused unless you pass maxMB/.test(n)));
+    assert.equal(uploadsTo("big").length, before, "dryRun 什麼都不送");
+    assert.ok(!existsSync(boxFile("big")));
+
+    assert.equal(parsed(await syncTool({ id: "bx", localPath: dir, dest: "big", maxMB: 4 })).ok, true);
+    assert.equal(statSync(boxFile("big/app/dist-win/setup.exe")).size, 3 * 1024 * 1024);
+    assert.equal((await syncTool({ id: "bx", localPath: dir, dest: "big", maxMB: 0 })).isError, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：sdk/ 子專案的 node_modules 沒裝，整合測試報 Cannot find module 'express'；
+// 增量同步後箱子裡的 node_modules 是舊的，tsc 被缺模組的錯誤淹沒。
+test("lockfile 所在的資料夾沒有 node_modules、或裝的跟 lockfile 不合時提醒重裝", async () => {
+  const { dir, git } = repo();
+  try {
+    const lock = (pkgs) => JSON.stringify({ name: "x", version: "1.0.0", lockfileVersion: 3, packages: { "": { name: "x", version: "1.0.0" }, ...pkgs } });
+    writeFileSync(join(dir, "package-lock.json"), lock({
+      "node_modules/express": { version: "4.19.2" },
+      "node_modules/fsevents": { version: "2.3.3", optional: true },
+    }));
+    mkdirSync(join(dir, "sdk"));
+    writeFileSync(join(dir, "sdk", "package-lock.json"), lock({ "node_modules/@modelcontextprotocol/sdk": { version: "1.30.0", dev: true } }));
+    git("add", "-A");
+    git("commit", "-qm", "locks");
+    let out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "deps" }));
+    assert.deepEqual(out.deps.map((d) => [d.dir, d.state]).sort(), [[".", "missing"], ["sdk", "missing"]]);
+    assert.ok(out.notes.some((n) => /\/work\/deps \(package-lock\.json\), \/work\/deps\/sdk \(package-lock\.json\) have lockfiles but no node_modules/.test(n) && /"dir": "deps", "cmd": "npm ci"/.test(n)), JSON.stringify(out.notes));
+
+    const install = (at, version) => {
+      mkdirSync(boxFile(at), { recursive: true });
+      writeFileSync(boxFile(`${at}/package.json`), JSON.stringify({ version }));
+    };
+    install("deps/node_modules/express", "4.19.2");
+    install("deps/sdk/node_modules/@modelcontextprotocol/sdk", "1.20.0");
+    out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "deps" }));
+    assert.deepEqual(out.deps, [{ dir: "sdk", lock: "package-lock.json", state: "stale", differ: 1, wanted: 1 }], "optional 的 fsevents 沒裝不算");
+    assert.ok(out.notes.some((n) => /node_modules in \/work\/deps\/sdk does not match its package-lock\.json: 1 of 1 packages.*@modelcontextprotocol\/sdk 1\.20\.0 \(lockfile: 1\.30\.0\).*npm ci/.test(n)), JSON.stringify(out.notes));
+
+    install("deps/sdk/node_modules/@modelcontextprotocol/sdk", "1.30.0");
+    out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "deps" }));
+    assert.equal(out.deps, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：baseline 樹沒有 node_modules，要手動 symlink 兩層；symlink 又讓兩個 vite 共用 .vite 快取互蓋，畫面卡在開機遮罩。
+test("baseline 用硬連結拿到自己的一份 node_modules，Vite 快取不共用", async () => {
+  const { dir } = repo();
+  try {
+    assert.equal(parsed(await syncTool({ id: "bx", localPath: dir, dest: "bl" })).ok, true);
+    mkdirSync(boxFile("bl/node_modules/x"), { recursive: true });
+    writeFileSync(boxFile("bl/node_modules/x/index.js"), "x\n");
+    mkdirSync(boxFile("bl/node_modules/.vite/deps"), { recursive: true });
+    writeFileSync(boxFile("bl/node_modules/.vite/deps/chunk.js"), "c\n");
+    mkdirSync(boxFile("bl/web/node_modules/y"), { recursive: true });
+    writeFileSync(boxFile("bl/web/node_modules/y/i.js"), "y\n");
+    const out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "bl", baseline: "HEAD" }));
+    assert.deepEqual(out.baseline.depsCopied.sort(), ["node_modules", "web/node_modules"]);
+    assert.equal(statSync(boxFile("bl-baseline/node_modules/x/index.js")).ino, statSync(boxFile("bl/node_modules/x/index.js")).ino, "硬連結，不另佔空間");
+    assert.ok(!existsSync(boxFile("bl-baseline/node_modules/.vite")), "Vite 快取各用各的");
+    assert.ok(existsSync(boxFile("bl/node_modules/.vite/deps/chunk.js")), "原本那份不能動");
+    assert.ok(existsSync(boxFile("bl-baseline/web/node_modules/y/i.js")));
+    assert.ok(existsSync(boxFile("bl-baseline/main.go")));
+
+    const again = parsed(await syncTool({ id: "bx", localPath: dir, dest: "bl", baseline: "HEAD" }));
+    assert.equal(again.baseline.depsCopied, undefined, "baseline 已經有的不再複製");
+    rmSync(boxFile("bl-baseline"), { recursive: true, force: true });
+    const off = parsed(await syncTool({ id: "bx", localPath: dir, dest: "bl", baseline: "HEAD", baselineDeps: false }));
+    assert.equal(off.baseline.depsCopied, undefined);
+    assert.ok(!existsSync(boxFile("bl-baseline/node_modules")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("第一次送進 dest：講被 ignore 擋下的設定檔與沒有 .git；gradlew 沒有執行權限時講怎麼跑", async () => {
+  const { dir, git } = repo();
+  try {
+    writeFileSync(join(dir, ".gitignore"), "dist\nnode_modules\ntsconfig.json\n.env.local\n");
+    writeFileSync(join(dir, "tsconfig.json"), "{}\n");
+    writeFileSync(join(dir, ".env.local"), "A=1\n");
+    writeFileSync(join(dir, "gradlew"), "#!/bin/sh\n", { mode: 0o644 });
+    writeFileSync(join(dir, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(join(dir, "lib.sh"), "x=1\n", { mode: 0o644 });
+    git("add", "-A");
+    git("commit", "-qm", "scripts");
+    const out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "fresh-notes" }));
+    const all = out.notes.join("\n");
+    assert.match(all, /\.env\.local, tsconfig\.json were not sent: the ignore rules skip them/);
+    assert.match(all, /alsoPaths: \[".env.local","tsconfig.json"\]/);
+    assert.match(all, /No \.git is sent, so git commands in \/work\/fresh-notes fail/);
+    const mode = out.notes.find((n) => /not executable/.test(n));
+    assert.match(mode, /^gradlew is not executable here.*bash gradlew.*git update-index --chmod=\+x gradlew/);
+    assert.ok(!/run\.sh|lib\.sh/.test(mode), "有執行權限的、沒有 #! 的 .sh 不用提");
+
+    const again = parsed(await syncTool({ id: "bx", localPath: dir, dest: "fresh-notes" }));
+    assert.ok(!(again.notes || []).some((n) => /No \.git|were not sent|not executable/.test(n)), "只在第一次、或那個檔有送時講");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：比對 783 個檔後報 Unexpected non-whitespace character after JSON at position 8。
+// control 在 exec 結果後面多接了點數提醒、人的留言（附圖），adapter 把它們全接起來 parse。
+test("exec 結果後面多接的點數提醒與人的留言不會弄壞比對，留言轉交給 agent", async () => {
+  const { dir } = repo();
+  let first = true;
+  setBoxExecForTest(async (args) => {
+    const run = localExec(args);
+    const content = [{ type: "text", text: JSON.stringify(first ? { ...run, fromHuman: ["請順便看一下登入頁"] } : run) }];
+    if (first) content.push({ type: "image", data: "aGk=", mimeType: "image/png" });
+    first = false;
+    content.push({ type: "text", text: "credits: 12 left, about 30m at the current rate." });
+    return { content };
+  });
+  try {
+    const res = await localTool("sandbox_sync", { id: "bx", localPath: dir, dest: "extras" });
+    assert.equal(res.isError, false, res.content[0].text);
+    assert.equal(parsed(res).ok, true);
+    const texts = res.content.filter((c) => c.type === "text").map((c) => c.text);
+    assert.ok(texts.some((t) => t.includes("請順便看一下登入頁")), "人的留言要交給 agent");
+    assert.equal(texts.filter((t) => t.startsWith("credits:")).length, 1, "重複的提醒只留一份");
+    assert.ok(res.content.some((c) => c.type === "image"));
+  } finally {
+    restoreExec();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：commit: HEAD 第一次回 fetch failed、箱子 ready 了第一次 sync 回 502，原樣重試都好了。
+test("上傳遇到 502 自動重試一次，回傳講明重試過", async () => {
+  const { dir } = repo();
+  try {
+    failOnce.set("retry502", 502);
+    const res = await syncTool({ id: "bx", localPath: dir, dest: "retry502" });
+    assert.equal(res.isError, false, res.content[0].text);
+    const out = parsed(res);
+    assert.ok(out.notes.some((n) => /first upload failed \(sync failed \(HTTP 502\).*sent again once/.test(n)), JSON.stringify(out.notes));
+    assert.ok(existsSync(boxFile("retry502/main.go")));
+  } finally {
+    failOnce.delete("retry502");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：sync 完全沒有回應，1800 秒後 client 才砍掉。
+test("整包送完箱子一直不回答：過了上限就回錯，不會掛著，也不重送", async () => {
+  const { dir } = repo();
+  try {
+    slowAnswer.add("slow");
+    const { out, sec } = await timed(syncTool({ id: "bx", localPath: dir, dest: "slow" }));
+    assert.equal(out.isError, true);
+    assert.match(out.content[0].text, /stalled after uploading: the box did not answer within 2s/);
+    assert.match(out.content[0].text, /NOT SYNCED/);
+    assert.ok(sec < 5, `上限 1.5 秒，花了 ${sec}s`);
+    assert.equal(uploadsTo("slow").length, 1, "卡住的不重送");
+  } finally {
+    slowAnswer.delete("slow");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：233 秒的 sync 中間沒有任何輸出，分不出是在傳還是卡住。
+test("sync 進行中定時回報做到哪一步", async () => {
+  const { dir } = repo();
+  setBoxExecForTest(async (args) => {
+    await new Promise((r) => setTimeout(r, 700));
+    return { content: [{ type: "text", text: JSON.stringify(localExec(args)) }] };
+  });
+  try {
+    const progress = [];
+    const res = await syncTool({ id: "bx", localPath: dir, dest: "prog" }, (p) => progress.push(p.message));
+    assert.equal(res.isError, false, res.content[0].text);
+    assert.ok(progress.some((m) => /^sandbox_sync to \/work\/prog: asking the box which of 2 files differ$/.test(m)), progress.join("\n"));
+  } finally {
+    restoreExec();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sandbox_pull：clean 把 localPath 換成箱子那份；寫成 dest 也收；下載連結被拒就重拿一次", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "psbx-pull-clean-"));
+  try {
+    mkdirSync(join(dir, "box", "shots"), { recursive: true });
+    writeFileSync(join(dir, "box", "shots", "a.png"), "a");
+    writeFileSync(join(dir, "box", "shots", "b.png"), "b");
+    const archive = execFileSync("tar", ["-czf", "-", "-C", join(dir, "box"), "shots"]);
+    downloads.set("/files/shots.tgz", [{ status: 403 }, { status: 200, body: archive }]);
+    let gets = 0;
+    setBoxGetForTest(async (args) => {
+      gets++;
+      assert.equal(args.path, "shots");
+      return { content: [{ type: "text", text: JSON.stringify({ url: apiURL("/files/shots.tgz"), archive: true, bytes: archive.length, ...(gets === 2 ? { changedWhileReading: ["shots/b.png"] } : {}) }) }] };
+    });
+    const local = join(dir, "local");
+    mkdirSync(local);
+    writeFileSync(join(local, "old.png"), "old");
+    const out = parsed(await pullTool({ id: "bx", path: "/work/shots", dest: local, clean: true }));
+    assert.equal(gets, 2, "被拒之後要再拿一條新的");
+    assert.deepEqual(readdirSync(local).sort(), ["a.png", "b.png"]);
+    assert.equal(out.removed, 1);
+    assert.deepEqual(out.removedPaths, ["old.png"]);
+    assert.deepEqual(out.changedWhileReading, ["shots/b.png"]);
+    assert.ok(out.notes.some((n) => /first download link was refused \(HTTP 403\)/.test(n)));
+    assert.ok(out.notes.some((n) => /changed on the box while it was being packed/.test(n)));
+    assert.deepEqual(readdirSync(dir).filter((n) => n.includes("psbx-pull")), [], "暫存資料夾要收掉");
+
+    mkdirSync(join(dir, "repo", ".git"), { recursive: true });
+    const bad = await pullTool({ id: "bx", path: "shots", localPath: join(dir, "repo"), clean: true });
+    assert.equal(bad.isError, true);
+    assert.match(bad.content[0].text, /git checkout/);
+    assert.equal(gets, 2, "拒絕 clean 時什麼都不拿");
+    assert.match((await pullTool({ id: "bx", path: "shots" })).content[0].text, /localPath .*not dest/);
+
+    downloads.set("/files/empty.log", [{ status: 200, body: "" }]);
+    setBoxGetForTest(async () => ({ content: [{ type: "text", text: JSON.stringify({ url: apiURL("/files/empty.log"), archive: false, bytes: 0 }) }] }));
+    const file = parsed(await pullTool({ id: "bx", path: "build.log", localPath: join(dir, "logs", "build.log") }));
+    assert.equal(file.files, 1);
+    assert.equal(readFileSync(join(dir, "logs", "build.log"), "utf8"), "");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

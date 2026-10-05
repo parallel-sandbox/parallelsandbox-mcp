@@ -64,8 +64,18 @@ refused before anything is uploaded).
 Pass an absolute path: a relative one resolves against this adapter's working directory (where your MCP client started
 it), which is not necessarily the agent's. In a git working tree it takes the tracked files plus the untracked files `.gitignore` does not
 exclude, asks the box which of them differ from what is already in `dest`, and uploads only those, so syncing after an edit
-sends just that edit. A file changed inside the box counts as different and gets the local version back. Outside git it
-uploads the whole directory, excluding `node_modules`, `.git`, `dist`, `build`, `coverage`, `.venv` and similar.
+sends just that edit. A file changed inside the box counts as different and gets the local version back, unless an
+`"exclude"` glob covers it (`["capacitor.config.ts", "renderer/dist-win"]`: such paths are neither sent nor compared,
+and the box's copy is never listed as stale or pruned). Outside git, and with `commit`, it compares and sends only the
+differences the same way; outside git it takes every file except `node_modules`, `.git`, `dist`, `build`, `coverage`,
+`.venv` and similar. No `.git` is sent.
+
+A sync that would send more than 100 MB (size on disk) sends nothing and lists the largest folders; raise the limit with
+`"maxMB"` when that size is expected. `"dryRun": true` compares with the box and reports what would be sent without
+sending or deleting anything. While it runs, the adapter reports progress every 10 seconds (hashing, comparing,
+megabytes uploaded) to clients that ask for progress. An upload that fails with `fetch failed`, a reset connection or
+HTTP 502/504 is sent once more, and `notes` says so; one where nothing moves for two minutes, or the box does not
+answer within ten minutes of receiving everything, fails with a message naming that step.
 
 The result says what happened: `sentPaths` (the first 50 files sent; `sentFiles` is the count), `changedOnBox` (files the
 box actually rewrote), `remotePath`, and in a working tree `uncommitted`, the paths that differ from `HEAD`. If other
@@ -77,11 +87,18 @@ Files deleted or renamed locally stay in the box and are listed in `staleInDest`
 (`node_modules`, build output, `.env`). `"prune": true` deletes them. A single file in `localPath` lands at `dest` itself
 (`"dest": "renderer/.env"` writes `/work/renderer/.env`), unless `dest` ends in `/` or is already a folder in the box.
 
+`node_modules` is never sent, so `notes` (and `deps`) say when a folder with a `package-lock.json`, `pnpm-lock.yaml` or
+`yarn.lock` has no `node_modules` in the box, or, for npm, one whose installed packages differ from the lockfile, with
+the command to run there. On the first sync into a `dest`, `notes` also lists build settings the ignore rules kept out
+(`tsconfig.json`, `.env.local`) and says how to send them, and a `gradlew`, `mvnw` or `*.sh` script starting with `#!`
+that lacks the executable bit is pointed out whenever it is sent.
+
 Submodules: without `commit`, an initialized submodule goes over as a plain directory, everything on disk in it. `git
 archive` leaves them out, so with `commit` pass `"submodules": true` to add each initialized submodule at the commit
 the tree records. `"baseline": "origin/main"` sends that commit to `<dest>-baseline` as well, so a failing test can be
-run on both sides to see whether it was already failing. When a sync fails, nothing new reached the box; the next
-`sandbox_exec` on that box carries a reminder.
+run on both sides to see whether it was already failing; each `node_modules` in `dest` is copied into the baseline as
+hard links where it has none (`"baselineDeps": false` skips that), leaving out Vite's cache so the two trees do not
+share one. When a sync fails, nothing new reached the box; the next `sandbox_exec` on that box carries a reminder.
 
 ## sandbox_pull
 
@@ -91,7 +108,15 @@ the reverse of `sandbox_sync`: `path` `app/dist` with `localPath` `/abs/dist` gi
 `/abs/dist/dist/index.html` (versions before 0.3.3 added that extra level). The result gives `files`, the number of
 files written, and `paths`, the first 50 of them. Pass `"extract": false` to keep the tar.gz
 as one file instead; it holds the directory itself as its top entry. Relative paths resolve the same way as for
-`sandbox_sync`. Only the local copy stays: the hand-off copy on ParallelSandbox's side is deleted after about a day.
+`sandbox_sync`; `dest` is accepted as another name for `localPath`. Only the local copy stays: the hand-off copy on
+ParallelSandbox's side is deleted after about a day.
+
+Extracting merges into what is already in `localPath`. `"clean": true` makes it exactly the box's directory instead: the
+archive is unpacked next to it first and swapped in only when that succeeds, and the result's `removed` counts the local
+files that went. `clean` is refused for a git checkout, your home directory, the adapter's working directory and their
+parents. Files the box was still writing while it packed the directory are listed in `changedWhileReading`. The
+download reports progress, gives up after two minutes without data, and fetches a fresh link once when the first is
+refused.
 
 ## Which conversation is using a box
 
@@ -100,6 +125,8 @@ it reports to `/v1/agents/<id>/heartbeat` once a minute, and when its conversati
 or SIGHUP) it reports `/v1/agents/<id>/leave`. The app uses this to tell a box the AI is still working in from one whose
 conversation was closed without `sandbox_review` or `sandbox_stop`; a conversation killed outright (no leave) counts as
 gone three minutes after its last heartbeat. Nothing else is sent: no prompt, no transcript.
+Restarting the client starts a new adapter with a new id, so a box the conversation used before the restart shows
+`agent.state` `left` until it is used again; the restarted conversation can simply continue with it.
 
 ## Timeouts
 
@@ -109,6 +136,11 @@ includes the review ID and entry URL before the final result. Use `waitSec: 0` f
 or resume a timed-out round with `reviewId` instead of creating another card with `what`. The adapter waits 31 minutes
 for takeover and review, and 65 minutes for other calls (a foreground `sandbox_exec` runs at most 60 minutes).
 Cancelling a client call also cancels its control connection; it does not delete the review or feedback.
+Each foreground `sandbox_exec` carries an `execId` the adapter picks. If its result is lost on the way back (no data for
+75 seconds, or the stream ends without it), the command keeps running on the box, and the error names
+`sandbox_procs {action: "wait", bgId: <execId>}`, which returns its exit code and the end of its output once it ends.
+The adapter also checks the server's tool list every 10 minutes and sends `notifications/tools/list_changed` when it
+changed, so a long conversation does not keep using an old schema.
 The waiting-tool route lasts for that active call. Registered native sessions use the supervisor below to continue after a turn exits.
 
 ## Continue after the AI finishes
@@ -191,6 +223,18 @@ the `logs_*` tools and the like) are retried once first. For anything else the e
 even finished on the box: check `sandbox_status` (its `steps[]` lists what was run) before running it again.
 `sandbox_status` can hand off pending human feedback once, so it is not automatically retried after a lost result;
 use `sandbox_report` with the report ID from the app to recover that report.
+
+## Troubleshooting
+
+- **The client times out starting the server (MCP `initialize` after 60 seconds) and shows no adapter error.**
+  `npx` is still downloading the package, so the adapter has not started yet. Look at the newest file in
+  `~/.npm/_logs/`. `ENETUNREACH` (or `ETIMEDOUT`) for `registry.npmjs.org` usually means the machine resolves an IPv6
+  address it cannot reach: add `"NODE_OPTIONS": "--dns-result-order=ipv4first"` to the server's `env` in the client's
+  MCP settings, or install once with `npm i -g parallelsandbox-mcp` and run `parallelsandbox-mcp` instead of `npx`.
+- **`the result never came back (connection from this computer to ParallelSandbox (...) failed: fetch failed (ENOTFOUND ...))`.**
+  The link between this computer and ParallelSandbox broke (DNS, proxy, VPN, Wi-Fi), not the box's own network. The
+  code in parentheses is the cause Node reported. The box's connections to your environment are in `sandbox_status`
+  `environment.connections[]`.
 
 ## Source and issues
 

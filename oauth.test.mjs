@@ -77,6 +77,10 @@ async function fixture() {
       const reply = (result) => json(200, { jsonrpc: "2.0", id: msg.id, result });
       if (msg.method === "initialize") return reply({ protocolVersion: msg.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "fake-control", version: "1" }, instructions: "Give boxes a goal." });
       if (msg.method === "tools/list") return reply({ tools: [{ name: "sandbox_list", description: "List boxes", inputSchema: { type: "object", properties: {} } }] });
+      // sandbox_sync 先在箱子裡比對（adapter 自己打 sandbox_exec）：當成箱子裡還沒有這個 dest，整包送。
+      if (msg.method === "tools/call" && msg.params?.name === "sandbox_exec") {
+        return reply({ content: [{ type: "text", text: JSON.stringify({ exitCode: 0, stdout: '{"all":true,"fresh":true,"deps":[]}\n', stderr: "" }) }] });
+      }
       if (msg.method === "tools/call") return reply({ content: [{ type: "text", text: "boxes listed" }] });
     }
     return json(200, { ok: true });

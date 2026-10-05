@@ -1,6 +1,6 @@
 {
   "name": "parallelsandbox-mcp",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "mcpName": "com.parallelsandbox/parallelsandbox",
   "description": "stdio adapter for the ParallelSandbox MCP server: runs locally so sandbox_sync and sandbox_pull can move files between your machine and a box",
   "type": "module",
