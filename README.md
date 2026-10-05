@@ -59,19 +59,37 @@ When using a dev endpoint, set both `PARALLELSANDBOX_MCP_URL` and `PARALLELSANDB
 ## sandbox_sync
 
 `{"id": "<box id>", "localPath": "/abs/path/to/repo", "dest": "repo"}` syncs `localPath` into `/work/<dest>` on the box.
+`dest` is relative to `/work` (`repo`, not `/work/repo`; a leading `/work/` is dropped and any other absolute path is
+refused before anything is uploaded).
 Pass an absolute path: a relative one resolves against this adapter's working directory (where your MCP client started
 it), which is not necessarily the agent's. In a git working tree it takes the tracked files plus the untracked files `.gitignore` does not
 exclude, asks the box which of them differ from what is already in `dest`, and uploads only those, so syncing after an edit
 sends just that edit. A file changed inside the box counts as different and gets the local version back. Outside git it
-uploads the whole directory, excluding `node_modules`, `.git`, `dist`, `build`, `coverage`, `.venv` and similar. Files
-deleted locally stay in the box.
+uploads the whole directory, excluding `node_modules`, `.git`, `dist`, `build`, `coverage`, `.venv` and similar.
+
+The result says what happened: `sentPaths` (the first 50 files sent; `sentFiles` is the count), `changedOnBox` (files the
+box actually rewrote), `remotePath`, and in a working tree `uncommitted`, the paths that differ from `HEAD`. If other
+sessions share the checkout, those may be their unfinished work: pass `"commit": "HEAD"` with `"alsoPaths"` listing your
+own files instead. `commit` takes any revision and fails if it does not exist. Without `commit`, `alsoPaths` sends only
+those paths.
+
+Files deleted or renamed locally stay in the box and are listed in `staleInDest`, leaving out paths your ignore rules skip
+(`node_modules`, build output, `.env`). `"prune": true` deletes them. A single file in `localPath` lands at `dest` itself
+(`"dest": "renderer/.env"` writes `/work/renderer/.env`), unless `dest` ends in `/` or is already a folder in the box.
+
+Submodules: without `commit`, an initialized submodule goes over as a plain directory, everything on disk in it. `git
+archive` leaves them out, so with `commit` pass `"submodules": true` to add each initialized submodule at the commit
+the tree records. `"baseline": "origin/main"` sends that commit to `<dest>-baseline` as well, so a failing test can be
+run on both sides to see whether it was already failing. When a sync fails, nothing new reached the box; the next
+`sandbox_exec` on that box carries a reminder.
 
 ## sandbox_pull
 
 `{"id": "<box id>", "path": "<path under /work>", "localPath": "/abs/path/on/your/machine"}` downloads a file or a
 directory from the box. A file is written to `localPath`. A directory's contents are extracted straight into `localPath`,
 the reverse of `sandbox_sync`: `path` `app/dist` with `localPath` `/abs/dist` gives `/abs/dist/index.html`, not
-`/abs/dist/dist/index.html` (versions before 0.3.3 added that extra level). Pass `"extract": false` to keep the tar.gz
+`/abs/dist/dist/index.html` (versions before 0.3.3 added that extra level). The result gives `files`, the number of
+files written, and `paths`, the first 50 of them. Pass `"extract": false` to keep the tar.gz
 as one file instead; it holds the directory itself as its top entry. Relative paths resolve the same way as for
 `sandbox_sync`. Only the local copy stays: the hand-off copy on ParallelSandbox's side is deleted after about a day.
 

@@ -1,7 +1,7 @@
 // 同步挑檔的規則錯了就是「箱子裡少東西」或「上傳幾 GB」，兩種都很難查，所以這幾個純函式要有測試。
 import { strict as assert } from "node:assert";
-import { execFileSync, spawn } from "node:child_process";
-import { createReadStream, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createReadStream, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,14 +14,40 @@ import { after as afterAllFeedback } from "node:test";
 const feedbackDir = mkdtempFeedback(`${feedbackTmp()}/psbx-adapter-feedback-`);
 afterAllFeedback(() => rmFeedback(feedbackDir, { recursive: true, force: true }));
 
-// 假的 control：只記下 adapter 打來的請求（心跳、離開、sync 上傳的那包 tar.gz）。
+// 假的 control：記下 adapter 打來的請求（心跳、離開、sync 上傳的那包 tar.gz）。
+// sync 上傳的那包照 boxd 的樣子解進假的 /work（fakeWork/<dest>，合併在原有的東西上），回 changed；
+// dest 在 failDests 裡的回 409，像凍住的箱子。fullOutputs 是假的 exec 完整輸出網址（outputUrl）。
 const seen = [];
+const fakeWork = mkdtempSync(join(tmpdir(), "psbx-fakework-"));
+const failDests = new Set();
+const fullOutputs = new Map();
 const api = createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
     const raw = Buffer.concat(chunks);
     seen.push({ method: req.method, url: req.url, headers: req.headers, body: raw.toString(), raw });
+    if (fullOutputs.has(req.url)) {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end(fullOutputs.get(req.url));
+      return;
+    }
+    const sync = req.url.match(/^\/v1\/boxes\/[^/]+\/sync\?dest=([^&]*)/);
+    if (sync) {
+      const dest = decodeURIComponent(sync[1]);
+      if (failDests.has(dest)) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end('{"error":"box frozen"}');
+        return;
+      }
+      const into = join(fakeWork, dest);
+      mkdirSync(into, { recursive: true });
+      const names = execFileSync("tar", ["-tzf", "-"], { input: raw, encoding: "utf8" }).split("\n").filter((n) => n && !n.endsWith("/"));
+      execFileSync("tar", ["-xzf", "-", "-C", into], { input: raw });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, dest, changed: names.length }));
+      return;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end('{"ok":true}');
   });
@@ -33,7 +59,17 @@ api.unref();
 process.env.PSBX_ADAPTER_NO_CONNECT = "1";
 process.env.PARALLELSANDBOX_API_KEY = process.env.PARALLELSANDBOX_API_KEY || "test-key";
 process.env.PARALLELSANDBOX_API_URL = `http://127.0.0.1:${api.address().port}`;
-const { AGENT_ID, archiveCommit, baselineDest, copyInto, gitFileList, ignoredTopLevel, presence, repoName, reviewWaitBudget, syncTool, unpackDirectory } = await import("./index.mjs");
+const { AGENT_ID, archiveCommit, baselineDest, boxRel, copyInto, gitFileList, ignoredTopLevel, presence, repoName, reviewWaitBudget, setBoxExecForTest,
+  staleEntries, staleSyncWarning, syncTool, unpackDirectory, workRel } = await import("./index.mjs");
+
+// 假的 sandbox_exec：指令在本機跑，/work 換成 fakeWork。比對、刪檔、看 dest 是不是資料夾都走這裡。
+const execs = [];
+function localExec({ cmd }) {
+  execs.push(cmd);
+  const r = spawnSync("bash", ["-c", cmd.replaceAll("/work/", `${fakeWork}/`)], { encoding: "utf8" });
+  return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr, truncated: false };
+}
+setBoxExecForTest(async (args) => ({ content: [{ type: "text", text: JSON.stringify(localExec(args)) }] }));
 
 function repo() {
   const dir = mkdtempSync(join(tmpdir(), "psbx-adapter-test-"));
@@ -345,6 +381,21 @@ const mcp = createServer((req, res) => {
     const call = { name, closed: false, reviewBudget: req.headers["x-psbx-review-wait-sec"] };
     mcpCalls.push(call);
     req.socket.on("close", () => (call.closed = true));
+    // control 的驗證上游出事：還沒進到工具就回 503（auth_blip 前兩次、auth_down 一直、lb_down 是 ALB 的 HTML）。
+    const seenTimes = mcpCalls.filter((c) => c.name === name).length;
+    if ((name === "auth_blip" && seenTimes <= 2) || name === "auth_down" || name === "lb_down") {
+      if (name === "lb_down") {
+        res.writeHead(503, { "Content-Type": "text/html" });
+        res.end("<html><body><h1>503 Service Temporarily Unavailable</h1></body></html>");
+        return;
+      }
+      const body = name === "auth_down"
+        ? { error: "auth unavailable: the CubeLV member center, which verifies ParallelSandbox sign-ins and API keys, is under maintenance. This call did not run and your boxes keep running; retry after 1s.", reason: "maintenance", retryAfterSec: 1 }
+        : { error: "auth unavailable: ParallelSandbox could not verify this token right now (the CubeLV member center answered HTTP 404). This call did not run and your boxes keep running; retry after 15s.", reason: "upstream_auth", retryAfterSec: 0 };
+      res.writeHead(503, { "Content-Type": "application/json", "Retry-After": String(body.retryAfterSec) });
+      res.end(JSON.stringify(body));
+      return;
+    }
     // control 的 keepAlive：20 秒後把回應升級成 SSE，之後定時送一則 still running。
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
     const event = (m) => res.write(`event: message\ndata: ${JSON.stringify(m)}\n\n`);
@@ -517,4 +568,358 @@ test("review transport declares the real host budget for both default and config
    assert.equal(mcpCalls.findLast(c=>c.name==="sandbox_review").reviewBudget,want);
   } finally {await client.close();}
  }
+});
+
+// 9/28：驗證上游出事時 control 回 503，adapter 不重試，agent 只拿到一行 "auth unavailable"。503 是還沒進到工具就被擋下，
+// 所以連會改東西的工具也退避重試；試完還不行要講已經中斷多久、原因是什麼。
+const unavailableEnv = { PSBX_ADAPTER_UNAVAILABLE_FIRST_MS: "50", PSBX_ADAPTER_UNAVAILABLE_BUDGET_MS: "1500" };
+
+test("503 是還沒進到工具就被擋下：短暫的上游抖動自己退避重試，連 exec 這種工具也一樣", async () => {
+  const client = await adapterClient(unavailableEnv);
+  try {
+    const progress = [];
+    const out = await client.callTool({ name: "auth_blip", arguments: {} }, undefined, { onprogress: (p) => progress.push(p) });
+    assert.equal(out.isError, undefined);
+    assert.equal(out.content[0].text, "auth_blip done");
+    assert.equal(mcpCalls.filter((c) => c.name === "auth_blip").length, 3);
+    assert.ok(progress.some((p) => /answered 503 \(upstream_auth\), retrying/.test(p.message)), "重試中要轉進度給 client");
+  } finally {
+    await client.close();
+  }
+});
+
+test("503 一直不好：在期限內放棄，講已經中斷多久與 control 給的原因", async () => {
+  const client = await adapterClient(unavailableEnv);
+  try {
+    const { out, sec } = await timed(client.callTool({ name: "auth_down", arguments: {} }));
+    assert.equal(out.isError, true);
+    const text = out.content[0].text;
+    assert.match(text, /answered HTTP 503 for \d+s \(since \d{4}-\d\d-\d\dT.*tries in this call, reason: maintenance\)/);
+    assert.match(text, /under maintenance/);
+    assert.match(text, /safe to call this again later/);
+    assert.ok(sec < 4, `重試總長 1.5 秒，花了 ${sec}s`);
+    assert.ok(mcpCalls.filter((c) => c.name === "auth_down").length >= 2);
+
+    // ALB 的 503（HTML）也一樣處理，原因說不出來就照實講
+    const lb = await client.callTool({ name: "lb_down", arguments: {} });
+    assert.equal(lb.isError, true);
+    assert.match(lb.content[0].text, /reason: unavailable\).*load balancer/s);
+  } finally {
+    await client.close();
+  }
+});
+
+afterAllFeedback(() => rmSync(fakeWork, { recursive: true, force: true }));
+
+const parsed = (res) => JSON.parse(res.content[0].text);
+const boxFile = (rel) => join(fakeWork, rel);
+const uploadsTo = (dest) => seen.filter((r) => r.url.startsWith(`/v1/boxes/bx/sync?dest=${encodeURIComponent(dest)}`));
+const tarNames = (raw) => execFileSync("tar", ["-tzf", "-"], { input: raw, encoding: "utf8" }).split("\n").filter((n) => n && !n.endsWith("/")).map((n) => n.replace(/^\.\//, "")).sort();
+
+// 使用回饋三十幾次：agent 在 exec 裡寫絕對路徑，照抄到 dest；整個目錄 sync 時還卡在上傳一半。
+test("dest 寫 /work/... 照樣收，其他絕對路徑與跑出 /work 的在上傳前就擋下", async () => {
+  assert.deepEqual(boxRel("/work/app"), { rel: "app", dir: false });
+  assert.deepEqual(boxRel("/work/app/src/"), { rel: "app/src", dir: true });
+  assert.deepEqual(boxRel("/work"), { rel: ".", dir: false });
+  assert.deepEqual(boxRel("a/./b//c"), { rel: "a/b/c", dir: false });
+  for (const bad of ["/tmp/x", "/Users/me/app", "../x", "a/../../x", "~/x"]) assert.ok(boxRel(bad).error, `${bad} 要擋下`);
+  assert.equal(workRel("/work/shots/a.png"), "shots/a.png");
+  assert.equal(workRel("/tmp/e2e/a.png"), "/tmp/e2e/a.png", "其他絕對路徑交給箱子判斷");
+  assert.equal(workRel("shots"), "shots");
+
+  const { dir } = repo();
+  try {
+    const before = seen.length;
+    const res = await syncTool({ id: "bx", localPath: dir, dest: "/var/app" });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /not \/work\/app/);
+    assert.equal(seen.length, before, "不合法的 dest 不能開始上傳");
+    const ok = await syncTool({ id: "bx", localPath: dir, dest: "/work/abs-dest" });
+    assert.equal(ok.isError, false, ok.content[0].text);
+    assert.equal(parsed(ok).remotePath, "/work/abs-dest");
+    assert.ok(existsSync(boxFile("abs-dest/main.go")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋十四次：dest 寫 renderer/.env，結果箱子裡多一個 renderer/.env/ 資料夾，檔案在裡面。
+test("單一檔案：dest 就是它在箱子裡的路徑；結尾 / 或箱子裡已經是資料夾才放進去", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "psbx-onefile-"));
+  try {
+    const file = join(dir, "local.env");
+    writeFileSync(file, "API=1\n");
+    let out = parsed(await syncTool({ id: "bx", localPath: file, dest: "one/renderer/.env" }));
+    assert.equal(out.remotePath, "/work/one/renderer/.env");
+    assert.ok(statSync(boxFile("one/renderer/.env")).isFile(), "dest 要是檔案，不是資料夾");
+    assert.equal(readFileSync(boxFile("one/renderer/.env"), "utf8"), "API=1\n");
+
+    writeFileSync(file, "API=2\n");
+    out = parsed(await syncTool({ id: "bx", localPath: file, dest: "one/renderer/.env" }));
+    assert.equal(readFileSync(boxFile("one/renderer/.env"), "utf8"), "API=2\n", "箱子裡已經是檔案時直接蓋過去");
+
+    out = parsed(await syncTool({ id: "bx", localPath: file, dest: "one/tools/" }));
+    assert.equal(out.remotePath, "/work/one/tools/local.env");
+    assert.ok(existsSync(boxFile("one/tools/local.env")));
+
+    mkdirSync(boxFile("one/existing"), { recursive: true });
+    out = parsed(await syncTool({ id: "bx", localPath: file, dest: "one/existing" }));
+    assert.equal(out.remotePath, "/work/one/existing/local.env", "箱子裡已經是資料夾就放進去");
+
+    const prune = await syncTool({ id: "bx", localPath: file, dest: "one/x", prune: true });
+    assert.equal(prune.isError, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋九次：本機刪掉的檔留在箱子裡，tsc、go build 多報錯。
+test("dest 裡多出來的檔列在 staleInDest，被忽略的與 node_modules 不算；prune 才刪", async () => {
+  const { dir, git } = repo();
+  try {
+    writeFileSync(join(dir, ".gitignore"), "dist\nnode_modules\n*.log\n");
+    writeFileSync(join(dir, "old.go"), "package main\n");
+    git("add", "-A");
+    git("commit", "-qm", "old");
+    assert.equal(parsed(await syncTool({ id: "bx", localPath: dir, dest: "stale" })).ok, true);
+    rmSync(join(dir, "old.go"));
+    mkdirSync(boxFile("stale/node_modules/x"), { recursive: true });
+    writeFileSync(boxFile("stale/node_modules/x/index.js"), "box installed\n");
+    writeFileSync(boxFile("stale/run.log"), "box log\n");
+    mkdirSync(boxFile("stale/legacy/deep"), { recursive: true });
+    writeFileSync(boxFile("stale/legacy/a.go"), "a\n");
+    writeFileSync(boxFile("stale/legacy/deep/b.go"), "b\n");
+
+    let out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "stale" }));
+    assert.equal(out.sentFiles, 0, "沒有改動就不送");
+    assert.deepEqual(out.sentPaths, []);
+    assert.equal(out.changedOnBox, 0);
+    assert.deepEqual(out.staleInDest.paths.sort(), ["legacy/a.go", "legacy/deep/b.go", "old.go"]);
+    assert.equal(out.staleInDest.count, 3);
+    assert.ok(out.notes.some((n) => /prune: true/.test(n)));
+    assert.ok(existsSync(boxFile("stale/old.go")), "沒帶 prune 不刪");
+
+    out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "stale", prune: true }));
+    assert.equal(out.pruned, 3);
+    assert.ok(!existsSync(boxFile("stale/old.go")));
+    assert.ok(!existsSync(boxFile("stale/legacy")), "刪空的資料夾一起收掉");
+    assert.ok(existsSync(boxFile("stale/node_modules/x/index.js")), "node_modules 不能動");
+    assert.ok(existsSync(boxFile("stale/run.log")), "被忽略的檔不能動");
+    assert.ok(existsSync(boxFile("stale/main.go")));
+
+    assert.match((await syncTool({ id: "bx", localPath: dir, dest: "/work", prune: true })).content[0].text, /not \/work itself/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("不是 git 工作區時 prune 不做，什麼都不送", async () => {
+  const plain = mkdtempSync(join(tmpdir(), "psbx-plain-prune-"));
+  try {
+    writeFileSync(join(plain, "a.txt"), "a\n");
+    const before = seen.length;
+    const res = await syncTool({ id: "bx", localPath: plain, dest: "plain", prune: true });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /git working tree/);
+    assert.equal(seen.length, before);
+  } finally {
+    rmSync(plain, { recursive: true, force: true });
+  }
+});
+
+test("箱子自己產生的大資料夾整個算一筆，不塞滿清單", () => {
+  const base = mkdtempSync(join(tmpdir(), "psbx-stale-"));
+  try {
+    mkdirSync(join(base, "src"));
+    writeFileSync(join(base, "src", "a.ts"), "a\n");
+    writeFileSync(join(base, "src", "gone.ts"), "x\n");
+    mkdirSync(join(base, "out"));
+    for (let i = 0; i < 5; i++) writeFileSync(join(base, "out", `${i}.js`), "x\n");
+    mkdirSync(join(base, "node_modules", "y"), { recursive: true });
+    writeFileSync(join(base, "node_modules", "y", "i.js"), "x\n");
+    const hex = (s) => Buffer.from(s).toString("hex");
+    const got = staleEntries(Buffer.from(base), new Set([hex("src/a.ts")]), [""], new Set(["node_modules"]), 100, 3);
+    assert.deepEqual(got.stale.map((h) => Buffer.from(h, "hex").toString()).sort(), ["out/", "src/gone.ts"]);
+    assert.equal(got.staleTotal, 2);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：sync 只回檔數，並行開發時看不出箱子裡測的是哪一版；改到 package.json 時 vite 整頁重載沒人知道。
+test("sync 回傳列出送了哪些檔、箱子改了幾個；改到 package.json 附上 dev server 的提醒", async () => {
+  const { dir, git } = repo();
+  try {
+    writeFileSync(join(dir, "package.json"), "{}\n");
+    git("add", "-A");
+    git("commit", "-qm", "pkg");
+    let out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "sent" }));
+    assert.deepEqual(out.sentPaths.sort(), [".gitignore", "main.go", "package.json"]);
+    assert.equal(out.changedOnBox, 3);
+    assert.equal(out.notes, undefined, "新的 dest 沒有開著的 dev server，不用提醒");
+
+    writeFileSync(join(dir, "package.json"), '{"name":"x"}\n');
+    out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "sent" }));
+    assert.deepEqual(out.sentPaths, ["package.json"]);
+    assert.ok(out.notes.some((n) => /package\.json changed: a running dev server/.test(n)), JSON.stringify(out));
+    assert.deepEqual(out.uncommitted.paths, ["M package.json"]);
+    assert.ok(out.notes.some((n) => /commit: "HEAD"/.test(n)), "有未提交的檔要建議改用 commit");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("沒有 commit 時 alsoPaths 只送那幾個路徑，送到 dest 底下同一個位置", async () => {
+  const { dir } = repo();
+  try {
+    mkdirSync(join(dir, "web", "ui"), { recursive: true });
+    writeFileSync(join(dir, "web", "ui", "a.ts"), "a\n");
+    mkdirSync(join(dir, "web", "ui", "node_modules"));
+    writeFileSync(join(dir, "web", "ui", "node_modules", "n.js"), "n\n");
+    writeFileSync(join(dir, "other.go"), "package main\n");
+    const res = await syncTool({ id: "bx", localPath: dir, dest: "only", alsoPaths: ["main.go", "web/ui"] });
+    assert.equal(res.isError, false, res.content[0].text);
+    const out = parsed(res);
+    assert.equal(out.uncommitted, undefined);
+    assert.deepEqual(tarNames(uploadsTo("only").at(-1).raw), ["main.go", "web/ui/a.ts"]);
+    assert.ok(existsSync(boxFile("only/web/ui/a.ts")));
+    assert.ok(!existsSync(boxFile("only/other.go")), "沒列的不送");
+    assert.match((await syncTool({ id: "bx", localPath: dir, dest: "only", alsoPaths: ["nope"] })).content[0].text, /not found/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：打錯的 revision 回 ok、uploaded 10240 bytes，實際 dest 是空的，測試白跑。
+test("commit 給不存在的 revision 直接回錯，什麼都不送", async () => {
+  const { dir } = repo();
+  try {
+    const before = seen.length;
+    const res = await syncTool({ id: "bx", localPath: dir, dest: "badrev", commit: "no-such-branch" });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /no-such-branch is not a commit/);
+    assert.equal(seen.length, before);
+    assert.match(archiveCommit(dir, "--output=/tmp/x").error, /not a commit/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("commit 模式也只送有變的檔，回傳解析後的 commit；baseline 一起送", async () => {
+  const { dir, git } = repo();
+  try {
+    const head = git("rev-parse", "HEAD").trim();
+    let out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "cm", commit: "HEAD", baseline: "HEAD" }));
+    assert.equal(out.commitSha, head);
+    assert.ok(existsSync(boxFile("cm/main.go")));
+    assert.ok(existsSync(boxFile("cm/dist/bundle.js")) === false, "commit 沒追蹤 dist");
+    assert.equal(out.baseline.dest, "cm-baseline");
+    assert.equal(out.baseline.commitSha, head);
+    assert.ok(existsSync(boxFile("cm-baseline/main.go")));
+    out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "cm", commit: "HEAD" }));
+    assert.equal(out.sentFiles, 0, "第二次沒改動就不送");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// 使用回饋：sync 回 409 之後 exec 照跑，cp 因為檔案沒同步失敗，被當成測試失敗。
+test("sync 失敗：明講箱子裡還是舊檔，列出原本要送的檔，下一個 exec 附提醒", async () => {
+  const { dir } = repo();
+  try {
+    failDests.add("frozen");
+    const res = await syncTool({ id: "bx-frozen", localPath: dir, dest: "frozen", alsoPaths: ["main.go"] });
+    assert.equal(res.isError, true);
+    assert.match(res.content[0].text, /box frozen/);
+    assert.match(res.content[0].text, /NOT SYNCED: \/work\/frozen still has its old files/);
+    assert.match(res.content[0].text, /sending 1 files: main.go/);
+    assert.match(staleSyncWarning("bx-frozen"), /last sandbox_sync to \/work\/frozen on this box failed/);
+    assert.equal(staleSyncWarning("bx-frozen"), "", "只提醒一次");
+
+    await syncTool({ id: "bx-frozen", localPath: dir, dest: "frozen", alsoPaths: ["main.go"] });
+    failDests.delete("frozen");
+    assert.equal(parsed(await syncTool({ id: "bx-frozen", localPath: dir, dest: "frozen", alsoPaths: ["main.go"] })).ok, true);
+    assert.equal(staleSyncWarning("bx-frozen"), "", "重送成功就不用提醒");
+  } finally {
+    failDests.delete("frozen");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// exec 只回最後 16 KB；長的比對清單要從 outputUrl 拿完整輸出，不然 JSON 被切掉開頭，sync 整個失敗。
+test("比對結果超過 exec 的輸出上限時改讀完整輸出", async () => {
+  const { dir } = repo();
+  let n = 0;
+  setBoxExecForTest(async (args) => {
+    const run = localExec(args);
+    if (args.cmd.includes("compare.mjs")) {
+      const url = `/full-output-${++n}`;
+      fullOutputs.set(url, run.stdout);
+      Object.assign(run, { stdout: run.stdout.slice(-10), truncated: true, outputUrl: `${process.env.PARALLELSANDBOX_API_URL}${url}` });
+    }
+    return { content: [{ type: "text", text: JSON.stringify(run) }] };
+  });
+  try {
+    const out = parsed(await syncTool({ id: "bx", localPath: dir, dest: "trunc" }));
+    assert.equal(out.ok, true);
+    assert.ok(existsSync(boxFile("trunc/main.go")));
+  } finally {
+    setBoxExecForTest(async (args) => ({ content: [{ type: "text", text: JSON.stringify(localExec(args)) }] }));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("submodules: commit 模式把子模組照 gitlink 的版本放進樹裡；沒 init 的列出來", () => {
+  const sub = mkdtempSync(join(tmpdir(), "psbx-sub-"));
+  const { dir, git } = repo();
+  let made;
+  try {
+    const sg = (...args) => execFileSync("git", ["-C", sub, ...args], { encoding: "utf8" });
+    sg("init", "-q");
+    sg("config", "user.email", "t@example.com");
+    sg("config", "user.name", "t");
+    writeFileSync(join(sub, "lib.go"), "package lib // v1\n");
+    sg("add", "-A");
+    sg("commit", "-qm", "v1");
+    git("-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "vendor/lib");
+    git("commit", "-qm", "sub");
+    writeFileSync(join(dir, "vendor", "lib", "lib.go"), "package lib // 沒提交的\n");
+
+    made = archiveCommit(dir, "HEAD");
+    assert.ok(!existsSync(join(made.dir, "vendor", "lib", "lib.go")), "沒帶 submodules 時 git archive 不展開");
+    rmSync(made.dir, { recursive: true, force: true });
+
+    made = archiveCommit(dir, "HEAD", { submodules: true });
+    assert.equal(made.error, undefined);
+    assert.equal(readFileSync(join(made.dir, "vendor", "lib", "lib.go"), "utf8"), "package lib // v1\n", "用 gitlink 記錄的版本，不是工作區");
+    assert.deepEqual(made.submodules.map((s) => s.path), ["vendor/lib"]);
+    assert.deepEqual(made.submodulesMissing, []);
+    rmSync(made.dir, { recursive: true, force: true });
+
+    rmSync(join(dir, "vendor", "lib"), { recursive: true, force: true });
+    mkdirSync(join(dir, "vendor", "lib"));
+    made = archiveCommit(dir, "HEAD", { submodules: true });
+    assert.deepEqual(made.submodulesMissing.map((s) => s.path), ["vendor/lib"]);
+    assert.match(made.submodulesMissing[0].why, /not initialized/);
+  } finally {
+    if (made?.dir) rmSync(made.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(sub, { recursive: true, force: true });
+  }
+});
+
+test("sandbox_pull 解資料夾時回寫了哪些檔", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "psbx-pull-list-"));
+  try {
+    mkdirSync(join(dir, "box", "dist", "assets"), { recursive: true });
+    writeFileSync(join(dir, "box", "dist", "index.html"), "<html></html>\n");
+    writeFileSync(join(dir, "box", "dist", "assets", "a.js"), "x\n");
+    const archive = join(dir, "dist.tar.gz");
+    execFileSync("tar", ["-czf", archive, "-C", join(dir, "box"), "dist"]);
+    const files = await unpackDirectory(createReadStream(archive), join(dir, "local"));
+    assert.deepEqual(files.sort(), ["assets/a.js", "index.html"]);
+    assert.ok(lstatSync(join(dir, "local", "assets", "a.js")).isFile());
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
