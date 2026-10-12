@@ -207,6 +207,9 @@ test("usage note appears only for a hook host without hooks, and disappears afte
   const note = installNote("claude-code", { home, env });
   assert.match(note.usage, /ask them now, in this conversation, whether you may run this once: .*install claude-code/);
   assert.match(reviewInstallNote("claude-code", { id: "b1", reviewId: "r1" }, { home, env }), /sandbox_review with \{"id":"b1","reviewId":"r1","waitSec":0\}/);
+  const designNote = reviewInstallNote("claude-code", { id: "b1", reviewId: "dsn_abc" }, { home, env });
+  assert.doesNotMatch(designNote, /call sandbox_review with/, "a design version cannot be re-registered through sandbox_review");
+  assert.match(designNote, /read it with sandbox_report\. Versions you draw after the install return here on their own\./);
   install("claude-code", { home, env, command: "psbx" });
   assert.ok(existsSync(join(home, "cfg", "settings.json")), "CLAUDE_CONFIG_DIR is honored");
   assert.equal(hooksInstalled("claude-code", { home, env }), true);
@@ -214,6 +217,7 @@ test("usage note appears only for a hook host without hooks, and disappears afte
   assert.equal(installNote("gemini-cli-mcp-client", { home, env }).host, "gemini");
   assert.match(setupInstructions({ home, env }), /Gemini CLI: .*install gemini/);
   assert.match(reviewInstallNote("gemini-cli-mcp-client", { id: "b1", reviewId: "r1" }, { home, env }), /not routed automatically in this run/);
+  assert.match(reviewInstallNote("gemini-cli-mcp-client", { id: "b1", reviewId: "dsn_abc" }, { home, env }), /Versions drawn after Gemini CLI restarts return here on their own\./);
   assert.doesNotMatch(setupInstructions({ home, env }), /Claude Code:/);
   install("gemini", { home, env, command: "psbx" });
   assert.equal(installNote("gemini-cli-mcp-client", { home, env }), null);

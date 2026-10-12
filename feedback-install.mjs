@@ -118,9 +118,15 @@ export function installNote(clientName, opts = {}) {
 
 // The same step for a review that already exists. Claude Code and Cursor reload hooks while running;
 // Gemini CLI reads them only when it starts.
+// A design version (sandbox_draft／sandbox_architecture／sandbox_schema, id dsn_…) is not a review card:
+// sandbox_review cannot re-register it, so only versions drawn after the install return on their own.
 export function reviewInstallNote(clientName, { id, reviewId }, opts = {}) {
   const note = installNote(clientName, opts);
   if (!note) return null;
+  if (String(reviewId).startsWith("dsn_")) {
+    const after = note.host === "gemini" ? "Versions drawn after Gemini CLI restarts" : "Versions you draw after the install";
+    return `${note.usage}\nFeedback on this design version does not return to this conversation automatically, even after the install, and sandbox_review cannot re-register it: when the person says they sent it, read it with sandbox_report. ${after} return here on their own.`;
+  }
   if (note.host === "gemini") return `${note.usage}\nGemini CLI loads hooks when it starts, so feedback for this review is not routed automatically in this run: sandbox_status or sandbox_review for box ${id} hands a submitted report to you. Reviews requested after Gemini CLI restarts return automatically.`;
   return `${note.usage}\nOnce the person agrees and it is installed, call sandbox_review with ${JSON.stringify({ id, reviewId, waitSec: 0 })} once so this review's feedback returns here. Until then, read submitted reports with sandbox_report.`;
 }
