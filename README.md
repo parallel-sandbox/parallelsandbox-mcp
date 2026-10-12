@@ -171,7 +171,7 @@ registered native runner.
 
 ### Feedback back to the original conversation (Codex, Claude Code, Cursor, Gemini CLI)
 
-After `sandbox_review` succeeds, App feedback for that review returns to the same conversation that asked for it.
+After `sandbox_review` succeeds, App feedback for that review returns to the same conversation that asked for it. The same holds for each version drawn with `sandbox_draft`, `sandbox_architecture` or `sandbox_schema`: what the person circles and says about it in the App comes back to the conversation that drew it.
 The adapter writes a ticket (box, review and the adapter's own agent id, no credentials) and starts one small local
 relay per account. The relay registers a feedback consumer for that conversation, claims submitted reports and hands
 the conversation a short follow-up telling it which report to read with `sandbox_report`; that read marks the App

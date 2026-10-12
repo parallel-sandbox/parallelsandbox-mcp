@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -237,4 +237,33 @@ test("the Claude Code route never runs inside Cursor or another client that load
   assert.equal(await runHook({ host: "claude-code", dir, env: {}, raw: { ...claude, conversation_id: "c1" } }), 0);
   assert.ok(Date.now() - started < 500);
   assert.equal(mailFor({ dir, host: "claude-code", session: "s1" }).length, 1);
+});
+
+// 草稿、架構圖、Schema 的每一版跟交件一樣回原對話：各家掛勾都要認得這三個工具，舊版裝的掛勾要被當成沒裝、提示重裝。
+test("design tools route feedback like sandbox_review, and older hook installs ask to be reinstalled", () => {
+  const home = tmp();
+  const env = { CLAUDE_CONFIG_DIR: join(home, "cfg") };
+  for (const host of ["claude-code", "gemini"]) {
+    const matcher = Object.values(hostConfig(host, { home, env }).add).flat().map((e) => e.matcher).filter(Boolean)[0];
+    for (const tool of ["sandbox_review", "sandbox_draft", "sandbox_architecture", "sandbox_schema"]) {
+      assert.match(`mcp__parallelsandbox__${tool}`, new RegExp(matcher), `${host} matcher covers ${tool}`);
+    }
+  }
+  install("claude-code", { home, env, command: "psbx" });
+  assert.equal(hooksInstalled("claude-code", { home, env }), true);
+  const file = join(home, "cfg", "settings.json");
+  const old = readFileSync(file, "utf8").replace("sandbox_(review|report|draft|architecture|schema)", "sandbox_(review|report)");
+  writeFileSync(file, old);
+  assert.equal(hooksInstalled("claude-code", { home, env }), false, "an install from before the design tools is not current");
+  install("claude-code", { home, env, command: "psbx" });
+  assert.equal(hooksInstalled("claude-code", { home, env }), true);
+});
+
+test("a drawn design version attaches the conversation the same way a review does", async () => {
+  const { attachFromTool } = await import("./feedback-hook.mjs");
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box-1", reviewId: "dsn_abc123", clientName: "cursor-vscode" });
+  const result = { content: [{ type: "text", text: JSON.stringify({ ok: true, id: "box-1", reviewId: "dsn_abc123", designId: "dsn_abc123", version: 2 }) }] };
+  assert.ok(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_draft", input: { id: "box-1" }, result } }));
+  assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_status", input: { id: "box-1" }, result } }), false);
 });

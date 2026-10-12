@@ -24,6 +24,9 @@ import { createFeedbackRoute } from "./feedback-relay.mjs";
 import { reviewInstallNote, setupInstructions } from "./feedback-install.mjs";
 import { sessionBridge } from "./session-bridge.mjs";
 
+// 交出去等人回話的工具：交件，以及草稿、架構圖、Schema 的每一版。人在 App 上的回報都照同一條路回到這個對話。
+const HANDOFF_TOOLS = new Set(["sandbox_review", "sandbox_draft", "sandbox_architecture", "sandbox_schema"]);
+
 // Subcommands share this bin: host hooks, their one-time install, and the feedback relay.
 const subcommand = process.argv[2];
 if (subcommand === "hook") process.exit(await (await import("./feedback-hook.mjs")).hookMain(process.argv.slice(2)));
@@ -263,6 +266,7 @@ console.log(JSON.stringify(out));
 // 箱子裡跑的刪檔程式（sandbox_sync 帶 prune 時）：清單每行一個路徑的 hex。
 const PRUNE_SCRIPT = `import { lstatSync, readFileSync, realpathSync, rmdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
+
 ${pruneEntries.toString()}
 const [list, dest] = process.argv.slice(2);
 const hexes = readFileSync(list, "utf8").split("\\n").filter(Boolean);
@@ -2212,7 +2216,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
       const warning = staleSyncWarning(args.id);
       if (warning) result.content = [...(result.content || []), {type: "text", text: warning}];
     }
-    if (name === "sandbox_review" && !result?.isError) {
+    if (HANDOFF_TOOLS.has(name) && !result?.isError) {
       const payload = result?.structuredContent || result?.content?.filter((item) => item.type === "text").map((item) => {
         try { return JSON.parse(item.text); } catch { return null; }
       }).find((item) => item?.ok === true && typeof item.reviewId === "string");

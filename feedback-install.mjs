@@ -34,7 +34,13 @@ export function hooksInstalled(host, opts = {}) {
   if (host === "codex") return true;
   const file = settingsFile(host, opts);
   if (!file || !existsSync(file)) return false;
-  try { return readFileSync(file, "utf8").includes(`hook --host ${host}`); } catch { return false; }
+  try {
+    const text = readFileSync(file, "utf8");
+    if (!text.includes(`hook --host ${host}`)) return false;
+    // 舊版裝的 matcher 比現在少（例如還沒有草稿、架構圖、Schema 工具）就當成沒裝：重裝會換成現在的
+    const matchers = Object.values(hostConfig(host, opts)?.add || {}).flat().map((e) => e.matcher).filter(Boolean);
+    return matchers.every((m) => text.includes(m));
+  } catch { return false; }
 }
 
 export function hostConfig(host, { command = DEFAULT_COMMAND, home = homedir(), env = process.env } = {}) {
@@ -42,7 +48,7 @@ export function hostConfig(host, { command = DEFAULT_COMMAND, home = homedir(), 
   if (host === "claude-code") return {
     file: settingsFile("claude-code", { home, env }),
     add: {
-      PostToolUse: [{ matcher: "mcp__.*__sandbox_(review|report)", hooks: [{ type: "command", command: hook("claude-code"), asyncRewake: true, timeout: 604800 }] }],
+      PostToolUse: [{ matcher: "mcp__.*__sandbox_(review|report|draft|architecture|schema)", hooks: [{ type: "command", command: hook("claude-code"), asyncRewake: true, timeout: 604800 }] }],
       SessionStart: [{ hooks: [{ type: "command", command: hook("claude-code"), asyncRewake: true, timeout: 604800 }] }],
     },
   };
@@ -56,7 +62,7 @@ export function hostConfig(host, { command = DEFAULT_COMMAND, home = homedir(), 
   if (host === "gemini") return {
     file: join(home, ".gemini", "settings.json"),
     add: {
-      AfterTool: [{ matcher: "sandbox_review", hooks: [{ type: "command", command: hook("gemini"), timeout: 30_000 }] }],
+      AfterTool: [{ matcher: "sandbox_(review|draft|architecture|schema)", hooks: [{ type: "command", command: hook("gemini"), timeout: 30_000 }] }],
       AfterAgent: [{ hooks: [{ type: "command", command: hook("gemini"), timeout: 1_800_000 }] }],
     },
   };

@@ -27,7 +27,7 @@ const profileAliases = {
   PSBX_GEMINI_TRUST_WORKSPACE: "GEMINI_CLI_TRUST_WORKSPACE", PSBX_GEMINI_VERTEX_AI: "GOOGLE_GENAI_USE_VERTEXAI",
   PSBX_GEMINI_PROJECT: "GOOGLE_CLOUD_PROJECT", PSBX_GEMINI_LOCATION: "GOOGLE_CLOUD_LOCATION",
 };
-const claudeDefaultTools = "mcp__parallelsandbox__sandbox_report,mcp__parallelsandbox__sandbox_review,mcp__parallelsandbox__sandbox_status";
+const claudeDefaultTools = "mcp__parallelsandbox__sandbox_report,mcp__parallelsandbox__sandbox_review,mcp__parallelsandbox__sandbox_status,mcp__parallelsandbox__sandbox_draft,mcp__parallelsandbox__sandbox_architecture,mcp__parallelsandbox__sandbox_schema";
 
 // Capture only named, nonsecret native settings, including empty settings so a
 // recovery shell cannot silently broaden permissions or change the model.
@@ -35,7 +35,7 @@ export function captureNativeProfile(provider, env = process.env) {
   if (!profileKeys[provider]) throw new Error("Unknown native provider");
   const profile = Object.fromEntries(profileKeys[provider].map((key) => [key,
     key === "PSBX_CLAUDE_ALLOWED_TOOLS" ? env[key] || claudeDefaultTools :
-      key === "PSBX_CODEX_ALLOWED_MCP_TOOLS" ? env[key] ?? "sandbox_report,sandbox_review,sandbox_status" :
+      key === "PSBX_CODEX_ALLOWED_MCP_TOOLS" ? env[key] ?? "sandbox_report,sandbox_review,sandbox_status,sandbox_draft,sandbox_architecture,sandbox_schema" :
       env[key] ?? env[profileAliases[key]] ?? ""]));
   for (const [key, value] of Object.entries(profile)) {
     if (typeof value !== "string" || value.length > 4096) throw new Error("Native profile values must be explicit nonsecret strings");

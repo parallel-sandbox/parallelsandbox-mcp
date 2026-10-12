@@ -264,3 +264,11 @@ test("an explicitly supplied host UI request handler can answer its own approval
   assert.deepEqual(f.messages.find((m) => m.id === "approval-1"), { id: "approval-1", result: { decision: "decline" } });
   assert.deepEqual(f.host.pendingHostRequests(), []);
 });
+
+test("design tools bind trusted parent session metadata like sandbox_review", () => {
+  const ticket = { boxId: "box-1", reviewId: "dsn_1", token: "ticket-secret" };
+  for (const tool of ["sandbox_draft", "sandbox_architecture", "sandbox_schema"]) {
+    const value = reviewHookBinding({ ...hook("dsn_1"), tool_name: `mcp__parallelsandbox__${tool}` }, ticket);
+    assert.equal(value?.sessionId, "original-thread", tool);
+  }
+});

@@ -143,7 +143,7 @@ test("recovery preserves an interrupted accepted message as explicitly retryable
 });
 
 test("saved native profile survives recovery shell changes without persisting credentials", async () => {
-  assert.equal(captureNativeProfile("codex", {}).PSBX_CODEX_ALLOWED_MCP_TOOLS, "sandbox_report,sandbox_review,sandbox_status");
+  assert.equal(captureNativeProfile("codex", {}).PSBX_CODEX_ALLOWED_MCP_TOOLS, "sandbox_report,sandbox_review,sandbox_status,sandbox_draft,sandbox_architecture,sandbox_schema");
   assert.equal(captureNativeProfile("codex", {PSBX_CODEX_ALLOWED_MCP_TOOLS: ""}).PSBX_CODEX_ALLOWED_MCP_TOOLS, "");
   assert.equal(captureNativeProfile("codex", {PSBX_CODEX_ALLOWED_MCP_TOOLS: "sandbox_report"}).PSBX_CODEX_ALLOWED_MCP_TOOLS, "sandbox_report");
   for (const baseURL of ["https://user:password@example.test", "https://example.test?key=private", "https://example.test#private"]) {

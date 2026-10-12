@@ -40,7 +40,7 @@ export function hookInput(host, raw) {
 }
 
 export function attachFromTool({ dir, host, input }) {
-  if (!/sandbox_review$/.test(input.tool || "")) return false;
+  if (!/sandbox_(review|draft|architecture|schema)$/.test(input.tool || "")) return false;
   const boxId = input.input?.id;
   const reviewId = reviewFromResult(input.result);
   if (typeof boxId !== "string" || !reviewId) return false;

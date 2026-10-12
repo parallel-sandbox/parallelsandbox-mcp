@@ -37,7 +37,7 @@ function writeConfig(stateDir, mcp, env) {
     lines.push("", "[mcp_servers.parallelsandbox]", `command = ${toml(mcp.command)}`, `args = ${toml(mcp.args)}`, `env = { ${entries.map(([key, value]) => `${toml(key)} = ${toml(value)}`).join(", ")} }`);
     // Headless exec cannot answer an MCP approval prompt. Pre-authorize only
     // the registered runner's explicit handoff tools, never the whole server.
-    const allowed = (env.PSBX_CODEX_ALLOWED_MCP_TOOLS ?? "sandbox_report,sandbox_review,sandbox_status")
+    const allowed = (env.PSBX_CODEX_ALLOWED_MCP_TOOLS ?? "sandbox_report,sandbox_review,sandbox_status,sandbox_draft,sandbox_architecture,sandbox_schema")
       .split(",").map((tool) => tool.trim()).filter(Boolean);
     if (allowed.some((tool) => !/^[a-zA-Z0-9_.-]+$/.test(tool))) throw new Error("Codex allowed MCP tools must be exact tool names");
     for (const tool of new Set(allowed)) {

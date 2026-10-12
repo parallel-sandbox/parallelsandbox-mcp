@@ -8,7 +8,8 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
-export const CODEX_REVIEW_TOOLS = Object.freeze(["mcp__parallelsandbox__sandbox_review", "mcp__parallelsandbox-mcp__sandbox_review"]);
+export const CODEX_REVIEW_TOOLS = Object.freeze(["sandbox_review", "sandbox_draft", "sandbox_architecture", "sandbox_schema"]
+  .flatMap((tool) => [`mcp__parallelsandbox__${tool}`, `mcp__parallelsandbox-mcp__${tool}`]));
 export const CODEX_FEEDBACK_CAPABILITY = "codex/turn-start-tool-output";
 export const defaultCodexStateDir = () => join(homedir(), ".cache", "parallelsandbox", "codex-feedback");
 const hash = (value) => createHash("sha256").update(value).digest("hex");
