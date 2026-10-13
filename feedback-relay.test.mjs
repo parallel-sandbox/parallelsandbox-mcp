@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { attachReview, codexThreadId, createFeedbackRoute, followUpText, hostCodexCli, mailFor, paths, readJson, runRelay, takeMail, ticketKey } from "./feedback-relay.mjs";
+import { attachReview, codexThreadId, createFeedbackRoute, followUpText, hostCodexCli, mailFor, paths, readJson, runRelay, takeMail, ticketKey, writeJson } from "./feedback-relay.mjs";
 import { hookInput, hostAncestors, hostGone, isClaudeCodeHook, reviewFromResult, runHook } from "./feedback-hook.mjs";
 import { hooksInstalled, hostConfig, hostFromClient, install, installNote, mergeHooks, reviewInstallNote, selfCommand, setupInstructions } from "./feedback-install.mjs";
 
@@ -270,4 +270,138 @@ test("a drawn design version attaches the conversation the same way a review doe
   const result = { content: [{ type: "text", text: JSON.stringify({ ok: true, id: "box-1", reviewId: "dsn_abc123", designId: "dsn_abc123", version: 2 }) }] };
   assert.ok(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_draft", input: { id: "box-1" }, result } }));
   assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_status", input: { id: "box-1" }, result } }), false);
+});
+
+// ---------- one review that cannot be bound never holds up the others ----------
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(check, ms = 3000) {
+  const end = Date.now() + ms;
+  while (!check()) { if (Date.now() > end) throw new Error("timed out waiting"); await pause(5); }
+}
+// Three hook-host reviews, each attached to its own conversation S1..S3.
+async function threeReviews(dir) {
+  const reviews = ["rev1", "rev2", "rev3"];
+  for (const [i, r] of reviews.entries()) {
+    await route(dir).trackReview({ boxId: "box1", reviewId: r, clientName: "claude-code" });
+    attachReview({ dir, host: "claude-code", session: `S${i + 1}`, boxId: "box1", reviewId: r });
+  }
+  return reviews;
+}
+const reportFor = (r) => ({ boxId: "box1", reviewId: r, reportId: `${r}-report` });
+const mailedTo = (dir, i) => mailFor({ dir, host: "claude-code", session: `S${i + 1}` }).length;
+
+test("a review the server refuses to bind is set aside: the others bind and get their feedback, and it is logged and tried once", async () => {
+  const dir = tmp();
+  const reviews = await threeReviews(dir);
+  // The ticket the relay meets second (readdir order) was rewritten by another agent, as resuming a review did before 0.5.6.
+  const order = readdirSync(paths(dir).tickets);
+  const badIndex = reviews.findIndex((r) => `${ticketKey("box1", r)}.json` === order[1]);
+  const bad = reviews[badIndex];
+  const badFile = join(paths(dir).tickets, order[1]);
+  writeJson(badFile, { ...readJson(badFile), agentId: "agentB" });
+  const be = backend(reviews.map(reportFor));
+  const binds = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (new URL(url).pathname === "/v1/feedback-consumers") {
+      binds.push(body.reviewId);
+      if (init.headers["X-Psbx-Agent"] !== "agentA") return json(403, { error: "only this review's original agent can bind feedback" });
+    }
+    if (url.endsWith("/claim")) await pause(10);
+    return be.fetchImpl(url, init);
+  };
+  const lines = [];
+  const print = (...a) => lines.push(a.join(" "));
+
+  // One pass still reports the refusal, but only after the other two reviews were bound and delivered.
+  await assert.rejects(runRelay({ dir, credKey: credOf(dir), fetchImpl, once: true, print }), /original agent can bind/);
+  reviews.forEach((r, i) => assert.equal(mailedTo(dir, i), r === bad ? 0 : 1, `${r} mailed`));
+
+  // A running relay logs the refusal once and does not ask again on later rounds.
+  binds.length = 0; lines.length = 0;
+  const stop = new AbortController();
+  const running = runRelay({ dir, credKey: credOf(dir), fetchImpl, scanMs: 5, signal: stop.signal, print });
+  await pause(300);
+  assert.equal(binds.filter((r) => r === bad).length, 1, "not requested again every round");
+  const refused = lines.filter((l) => l.includes("cannot bind review"));
+  assert.equal(refused.length, 1, lines.join("\n"));
+  assert.ok(refused[0].includes(`review ${bad} on box box1 (ticket ${order[1].slice(0, -5)}`) && refused[0].includes("HTTP 403"), refused[0]);
+  assert.ok(reviews.filter((r) => r !== bad).every((r) => lines.some((l) => l.includes(`bound review ${r} `))));
+
+  // Putting the original agent back into the ticket file makes the relay try it again, and it binds.
+  writeJson(badFile, { ...readJson(badFile), agentId: "agentA" });
+  await until(() => mailedTo(dir, badIndex) === 1);
+  stop.abort();
+  await running;
+  assert.equal(binds.filter((r) => r === bad).length, 2);
+});
+
+test("a server error on one review backs off and binds later, without holding up the others", async () => {
+  const dir = tmp();
+  for (const [r, s] of [["rev1", "S1"], ["rev2", "S2"]]) {
+    await route(dir).trackReview({ boxId: "box1", reviewId: r, clientName: "claude-code" });
+    attachReview({ dir, host: "claude-code", session: s, boxId: "box1", reviewId: r });
+  }
+  const be = backend([reportFor("rev1"), reportFor("rev2")]);
+  const attempts = [], bindsOk = [];
+  let failures = 2;
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (new URL(url).pathname === "/v1/feedback-consumers") {
+      if (body.reviewId === "rev1") { attempts.push(Date.now()); if (failures-- > 0) return json(503, { error: "unavailable" }); }
+      bindsOk.push({ reviewId: body.reviewId, at: Date.now() });
+    }
+    if (url.endsWith("/claim")) await pause(10);
+    return be.fetchImpl(url, init);
+  };
+  const lines = [];
+  const stop = new AbortController();
+  const running = runRelay({ dir, credKey: credOf(dir), fetchImpl, scanMs: 5, bindRetryMs: 60, bindRetryMaxMs: 1000, signal: stop.signal, print: (...a) => lines.push(a.join(" ")) });
+  await until(() => mailedTo(dir, 0) === 1);
+  stop.abort();
+  await running;
+  assert.equal(attempts.length, 3, "two failures, then success");
+  assert.ok(attempts[1] - attempts[0] >= 60, `first retry waited ${attempts[1] - attempts[0]}ms`);
+  assert.ok(attempts[2] - attempts[1] >= 120, `second retry doubled to ${attempts[2] - attempts[1]}ms`);
+  assert.equal(mailedTo(dir, 1), 1, "the other review was delivered");
+  assert.ok(bindsOk.find((b) => b.reviewId === "rev2").at <= attempts[1], "the other review did not wait for the retry");
+  assert.equal(lines.filter((l) => l.includes("cannot bind review rev1")).length, 1, "the same error is logged once");
+  assert.ok(lines.some((l) => l.includes("bound review rev1 ")));
+});
+
+test("an unreadable ticket file is skipped without stopping the other reviews", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: "rev1" });
+  writeFileSync(join(paths(dir).tickets, `${"0".repeat(40)}.json`), "{");
+  const lines = [];
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: backend([reportFor("rev1")]).fetchImpl, once: true, print: (...a) => lines.push(a.join(" ")) });
+  assert.equal(mailedTo(dir, 0), 1);
+  assert.ok(lines.some((l) => l.includes(`cannot read ticket ${"0".repeat(40)}`)));
+  let spawned = 0;
+  await route(dir, { spawnRelay: async () => { spawned++; return { running: true }; } }).resumeRelay();
+  assert.equal(spawned, 1, "a restart still finds the pending review");
+});
+
+test("resuming another agent's review keeps its original ticket; the same agent or an expired ticket is rewritten", async () => {
+  const dir = tmp();
+  const file = join(paths(dir).tickets, `${ticketKey("box1", "rev1")}.json`);
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
+  const original = readJson(file);
+  let spawned = 0;
+  const other = route(dir, { agentId: "agentB", spawnRelay: async () => { spawned++; return { running: true }; } });
+  const kept = await other.trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: "01a0f429-b209-77a2-b784-f314221e0c92" } });
+  assert.deepEqual(readJson(file), original, "agent, Codex thread and client stay the original's");
+  assert.deepEqual([kept.automatic, kept.reason], [false, "opened_by_another_agent"]);
+  assert.match(kept.note, /keeps returning to the conversation that opened it/);
+  assert.equal(spawned, 1, "the relay is still kept running for the original ticket");
+
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  const same = readJson(file);
+  assert.deepEqual([same.agentId, same.client, same.codex], ["agentA", "claude-code", undefined], "the same agent updates its ticket as before");
+
+  writeJson(file, { ...same, expiresAt: Date.now() - 1 });
+  const taken = await other.trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  assert.equal(readJson(file).agentId, "agentB", "an expired ticket no longer holds the route");
+  assert.equal(taken.automatic, "when_hooks_installed");
 });

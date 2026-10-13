@@ -2235,7 +2235,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
             const route = await feedbackRoute.trackReview({boxId: args.id, reviewId: payload.reviewId, clientName: server.getClientVersion?.()?.name, meta: req.params._meta});
             const missing = reviewInstallNote(server.getClientVersion?.()?.name, {id: args.id, reviewId: payload.reviewId});
             const automatic = route.automatic === true || (route.automatic && !missing);
-            result.content = [...(result.content || []), {type: "text", text: automatic
+            // A reviewId resumed from another conversation (or after this adapter restarted) keeps its original route.
+            result.content = [...(result.content || []), {type: "text", text: route.reason === "opened_by_another_agent" ? route.note : automatic
               ? "App feedback for this review returns to this same conversation as a follow-up message. You may finish your turn; the follow-up tells you which report to read with sandbox_report."
               : missing || "Automatic delivery to this conversation is not available; read a submitted report with sandbox_report."}];
           }

@@ -9,6 +9,7 @@
 //                 codex  : `codex queue --thread` into Codex's own follow-up queue
 //                 hook   : a private mailbox the conversation's hook waits on (feedback-hook.mjs)
 //               and acknowledges host acceptance only after the host took the follow-up.
+//               Each ticket binds on its own: one the server refuses never holds up the others.
 //   adapter  -> when that conversation reads the report with sandbox_report, acknowledges `read`.
 // Credentials stay in the adapter and relay environments; state files hold ids only.
 import { execFile, spawn } from "node:child_process";
@@ -55,6 +56,10 @@ export function createOnce(path, value) {
 }
 export const orNull = (fn) => { try { return fn(); } catch (err) { if (err.code === "ENOENT") return null; throw err; } };
 const list = (dir) => orNull(() => readdirSync(dir)) || [];
+// Ticket files only: writeJson's in-flight "<key>.json.<pid>.<rand>.tmp" files are skipped.
+const ticketNames = (dir) => list(dir).filter((n) => n.endsWith(".json"));
+// One unreadable ticket must never stop the others from being considered.
+const ticketOrNull = (path) => { try { return readJson(path); } catch { return null; } };
 export function alive(pid) { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; } }
 export const paths = (dir) => ({ dir, tickets: join(dir, "tickets"), attach: join(dir, "attach"), journal: join(dir, "journal"), mail: join(dir, "mail"), run: join(dir, "run") });
 
@@ -117,6 +122,18 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
     // Called after a successful sandbox_review. Codex names its thread here; hook hosts attach later.
     async trackReview({ boxId, reviewId, clientName, meta }) {
       privateDir(dir); privateDir(p.tickets);
+      const file = join(p.tickets, `${ticketKey(boxId, reviewId)}.json`);
+      // Only the agent that opened a review may bind its feedback (the server answers 403 to anyone else), and that
+      // review's feedback belongs to the conversation that opened it. Another conversation, or this one after its
+      // adapter restarted with a new agent id, resuming the same reviewId keeps the original ticket untouched:
+      // rewriting it with this agent id would leave a ticket the server never binds.
+      const prev = ticketOrNull(file);
+      if (prev?.agentId && prev.agentId !== agentId && prev.boxId === boxId && prev.reviewId === reviewId && Date.now() < prev.expiresAt) {
+        if (prev.credKey === credKey) await spawnRelay({ dir, credKey, env, log });
+        log(`feedback: review ${reviewId} on box ${boxId} was opened by another agent; its App feedback keeps returning to the conversation that opened it`);
+        return { automatic: false, host: prev.codex ? "codex" : (prev.client || "unknown"), route: "original conversation", reason: "opened_by_another_agent",
+          note: "This review was opened by another conversation, or by this one before its ParallelSandbox connection restarted. Its App feedback keeps returning to the conversation that opened it; if no follow-up arrives here, read a submitted report with sandbox_report." };
+      }
       const ticket = { boxId, reviewId, agentId, apiUrl: api, mcpUrl, credKey, client: clientName || "", createdAt: Date.now(), expiresAt: Date.now() + TICKET_LIFETIME_MS };
       const threadId = codexThreadId(meta, clientName);
       if (threadId) {
@@ -124,7 +141,7 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
         const cliPath = await cliPromise;
         if (cliPath) ticket.codex = { threadId, cliPath, codexHome: env.CODEX_HOME || "" };
       }
-      writeJson(join(p.tickets, `${ticketKey(boxId, reviewId)}.json`), ticket);
+      writeJson(file, ticket);
       await spawnRelay({ dir, credKey, env, log });
       if (threadId && !ticket.codex) return { automatic: false, host: "codex", reason: "codex_cli_not_found", note: "Set PSBX_CODEX_CLI to this host's absolute codex executable." };
       if (ticket.codex) return { automatic: true, host: "codex", route: "codex queue", threadId };
@@ -146,7 +163,7 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
     },
     // After a reboot or a crashed relay, any adapter start brings pending tickets back.
     async resumeRelay() {
-      const pending = list(p.tickets).some((n) => { const t = orNull(() => readJson(join(p.tickets, n))); return t && t.credKey === credKey && Date.now() < t.expiresAt; });
+      const pending = ticketNames(p.tickets).some((n) => { const t = ticketOrNull(join(p.tickets, n)); return t && t.credKey === credKey && Date.now() < t.expiresAt; });
       return pending ? spawnRelay({ dir, credKey, env, log }) : null;
     },
   };
@@ -202,17 +219,26 @@ export function sessionExpectsFeedback({ dir = defaultFeedbackDir(), host, sessi
 // ---------- relay ----------
 const sleep = (ms, signal) => new Promise((r) => { const t = setTimeout(r, ms); signal?.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true }); });
 
-export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25 }) {
+// A ticket the server refuses to bind is set aside until its file changes; a failure that may pass
+// (network, timeout, 401/408/425/429, 5xx) is retried after 30 s, doubling up to 10 minutes.
+export const BIND_RETRY_MS = 30_000, BIND_RETRY_MAX_MS = 600_000;
+const retryableStatus = (status) => !status || status >= 500 || [401, 408, 425, 429].includes(status);
+
+export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, signal, print = console.log }) {
   const p = paths(dir);
   privateDir(p.run); privateDir(p.journal); privateDir(p.mail);
   const pidFile = join(p.run, `relay-${credKey}.pid`);
-  const say = (...a) => console.log(stamp(), ...a);
+  const say = (...a) => print(stamp(), ...a);
   const owner = Number(orNull(() => readFileSync(pidFile, "utf8")) || 0);
   if (owner && owner !== process.pid && alive(owner)) { say("another relay owns", credKey); return; }
   writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
   const controller = new AbortController();
+  if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener("abort", () => controller.abort(), { once: true }); }
   const loops = new Map(); // consumerId -> promise
   const bound = new Set(); // consumerId/ticket
+  // Tickets that could not be bound or read, by ticket key: { sig, message, retryAt, delay }.
+  // retryAt is Infinity for a refusal: that ticket is tried again only after its file changes (sig).
+  const setAside = new Map();
   let fetcher = fetchImpl, lastWork = Date.now();
   try {
     const request = async (ticket, agentId, path, body) => {
@@ -227,7 +253,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
     };
     const targetOf = (ticket, key) => {
       if (ticket.codex) return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
-      const a = orNull(() => readJson(join(p.attach, `${key}.json`)));
+      const a = ticketOrNull(join(p.attach, `${key}.json`));
       return a ? { kind: "hook", host: a.host, id: a.session } : null;
     };
     const deliver = async (consumer, event) => {
@@ -292,20 +318,56 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         }
       }
     };
+    // Records one ticket that could not be read or bound. It is logged the first time, and again only when the
+    // error or the ticket file changes; a refusal waits for the ticket file to change, anything else backs off.
+    const setTicketAside = (key, sig, err, describe, retry = retryableStatus(err.status)) => {
+      const prev = setAside.get(key);
+      const delay = !retry ? 0 : prev && prev.sig === sig && prev.delay ? Math.min(prev.delay * 2, bindRetryMaxMs) : bindRetryMs;
+      const message = `${err.message || err}${err.status ? ` (HTTP ${err.status})` : ""}`;
+      if (!prev || prev.sig !== sig || prev.message !== message) {
+        say(describe, message, retry ? `- retrying in ${delay < 1000 ? `${delay}ms` : `${Math.round(delay / 1000)}s`}; other reviews are not affected` : "- set aside until its ticket file changes; other reviews are not affected");
+      }
+      setAside.set(key, { sig, message, delay, retryAt: retry ? Date.now() + delay : Infinity });
+    };
+    // Every ticket is handled on its own: one that cannot be read or bound never holds up the others.
+    // A ticket set aside still counts as active, like a ticket whose conversation has not attached yet:
+    // every unexpired ticket keeps the relay up, matching resumeRelay, which would otherwise start a new relay
+    // that tries the same ticket again a minute later.
     const scan = async () => {
-      let active = 0;
-      for (const name of list(p.tickets)) {
-        const key = name.replace(/\.json$/, "");
-        const ticket = orNull(() => readJson(join(p.tickets, name)));
+      let active = 0, firstError = null;
+      const seen = new Set();
+      for (const name of ticketNames(p.tickets)) {
+        if (controller.signal.aborted) break;
+        const key = name.slice(0, -".json".length), path = join(p.tickets, name);
+        seen.add(key);
+        const st = (() => { try { return lstatSync(path); } catch { return null; } })();
+        if (!st) continue;
+        let ticket;
+        try { ticket = readJson(path); }
+        catch (err) {
+          if (err.code !== "ENOENT") setTicketAside(key, `file:${st.mtimeMs}:${st.size}`, err, `cannot read ticket ${key}:`, false);
+          continue;
+        }
         if (!ticket || ticket.credKey !== credKey) continue;
-        if (Date.now() > ticket.expiresAt) { orNull(() => unlinkSync(join(p.tickets, name))); orNull(() => unlinkSync(join(p.attach, name))); continue; }
+        if (Date.now() > ticket.expiresAt) { orNull(() => unlinkSync(path)); orNull(() => unlinkSync(join(p.attach, name))); setAside.delete(key); continue; }
         active++;
         const target = targetOf(ticket, key);
         if (!target) continue;
         const consumerId = `fr_${sha("consumer", ticket.agentId, target.host, target.id).slice(0, 40)}`;
         const bindKey = `${consumerId}/${key}`;
         if (!bound.has(bindKey)) {
-          await request(ticket, ticket.agentId, "", { consumerId, boxId: ticket.boxId, reviewId: ticket.reviewId, host: target.host, capability: CAPABILITIES[target.host] });
+          const sig = sha(JSON.stringify(ticket), target.host, target.id, st.mtimeMs);
+          const prev = setAside.get(key);
+          if (prev && prev.sig === sig && Date.now() < prev.retryAt) continue;
+          try {
+            await request(ticket, ticket.agentId, "", { consumerId, boxId: ticket.boxId, reviewId: ticket.reviewId, host: target.host, capability: CAPABILITIES[target.host] });
+          } catch (err) {
+            if (controller.signal.aborted) break;
+            setTicketAside(key, sig, err, `cannot bind review ${ticket.reviewId} on box ${ticket.boxId} (ticket ${key}, agent ${ticket.agentId}, ${target.host} ${target.id}):`);
+            firstError ||= err;
+            continue;
+          }
+          setAside.delete(key);
           bound.add(bindKey);
           lastWork = Date.now();
           say("bound review", ticket.reviewId, "to", target.host, target.id);
@@ -314,9 +376,12 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
           const consumer = { id: consumerId, agentId: ticket.agentId, ticket, target };
           const loop = consume(consumer).finally(() => loops.delete(consumerId));
           loops.set(consumerId, loop);
-          if (once) await loop;
+          if (once) { try { await loop; } catch (err) { firstError ||= err; } }
         }
       }
+      for (const key of setAside.keys()) if (!seen.has(key)) setAside.delete(key);
+      // A one-shot run (tests, diagnostics) still reports the first failure, after every other ticket was handled.
+      if (once && firstError) throw firstError;
       return active;
     };
     say("relay started", credKey);
@@ -326,7 +391,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
       try { active = await scan(); } catch (err) { say("scan:", err.message); if (once) throw err; }
       if (once) break;
       if (!active && !loops.size && Date.now() - lastWork > idleExitMs) { say("no pending reviews; relay exits"); break; }
-      await sleep(scanMs);
+      await sleep(scanMs, controller.signal);
     }
   } finally {
     controller.abort();

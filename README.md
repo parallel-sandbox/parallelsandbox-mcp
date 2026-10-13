@@ -201,7 +201,10 @@ conversation's next turn ends.
 
 State lives in `~/.cache/parallelsandbox/feedback` (override with `PSBX_FEEDBACK_DIR`), mode 0600, for seven days.
 A report is never handed to a different conversation, never queued twice, and a hook whose host process has exited
-takes nothing. Set `PSBX_CODEX_CLI` only when the adapter cannot find its host `codex` process (for example on Windows).
+takes nothing. A review that cannot be registered (the server lets only the conversation that opened a review route
+its feedback) is logged once and set aside; it never holds up feedback for other reviews, and temporary server or
+network errors are retried with backoff. Calling `sandbox_review` with an existing `reviewId` from another
+conversation, or after the adapter restarted, keeps that review's original route. Set `PSBX_CODEX_CLI` only when the adapter cannot find its host `codex` process (for example on Windows).
 
 To wait the full 30 minutes in Codex, set `tool_timeout_sec = 1920` for this MCP server and
 `PSBX_TOOL_TIMEOUT_SEC = "1920"` in that server's adapter environment, then restart/reconnect the server using adapter
