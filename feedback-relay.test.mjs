@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { attachReview, codexThreadId, createFeedbackRoute, followUpText, hostCodexCli, mailFor, paths, readJson, runRelay, takeMail, ticketKey, writeJson } from "./feedback-relay.mjs";
-import { hookInput, hostAncestors, hostGone, isClaudeCodeHook, reviewFromResult, runHook } from "./feedback-hook.mjs";
+import { foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
 import { hooksInstalled, hostConfig, hostFromClient, install, installNote, mergeHooks, reviewInstallNote, selfCommand, setupInstructions } from "./feedback-install.mjs";
 
 const T = "01a0f429-b209-77a2-b784-f314221e0c91";
@@ -173,6 +173,56 @@ test("end-of-turn hooks do not hold conversations that expect no feedback", asyn
   assert.equal(out, "{}");
   assert.ok(Date.now() - started < 1500);
   assert.equal(await runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "none" }, raw: { hook_event_name: "SessionStart", session_id: "none" } }), 0);
+});
+
+// `claude -p "<prompt>"` 會把 asyncRewake 掛勾放在前景跑：工具結果要等掛勾結束。10/19 讀完 sandbox_report 後掛勾等下一則回饋，
+// 那份回報卡了 42 分鐘沒交給 AI。前景只有剛交件、還在等人的那次會等；sandbox_report 與 SessionStart 只交出已到的回饋就走。
+test("claude -p runs the hook in the foreground: only an open review waits, sandbox_report returns at once", async () => {
+  assert.equal(foregroundHookArgs(["claude", "--model", "x", "-p", "do", "it", "--output-format", "stream-json"]), true);
+  assert.equal(foregroundHookArgs(["claude", "--print", "--input-format", "stream-json", "--output-format", "stream-json"]), false, "SDK and native supervisor");
+  assert.equal(foregroundHookArgs(["claude", "-p", "--input-format=stream-json"]), false);
+  assert.equal(foregroundHookArgs(["claude", "--output-format", "stream-json", "--input-format", "stream-json", "--resume=x"]), false, "desktop app");
+  assert.equal(foregroundHookArgs(["claude"]), false, "interactive CLI");
+  const args = { 42: ["claude", "-p", "hi"], 7: ["sh", "-c", "npx"], 8: ["claude", "-p", "hi"] };
+  const argsOf = async (pid) => args[pid] || [];
+  assert.equal(await hostRunsHookInForeground({ env: { CLAUDE_PID: "42" }, argsOf }), true);
+  assert.equal(await hostRunsHookInForeground({ env: { CLAUDE_PID: "7" }, argsOf }), false);
+  const parents = { [process.ppid]: 7, 7: 8, 8: 1 };
+  assert.equal(await hostRunsHookInForeground({ env: {}, argsOf: async (pid) => (pid === process.ppid ? ["npm", "exec"] : args[pid] || []), ps: async (pid) => ({ ppid: parents[pid] ?? 1 }) }), true, "older Claude Code without CLAUDE_PID");
+
+  const REV = "068966a4b7d5ef6dc057";
+  const open = { content: [{ type: "text", text: JSON.stringify({ reviewId: REV, status: "waiting", waitSec: 0 }) }] };
+  assert.equal(reviewAwaitsPerson(open), true);
+  assert.equal(reviewAwaitsPerson({ content: [{ type: "text", text: JSON.stringify({ reviewId: REV, outcome: "timed_out" }) }] }), true);
+  assert.equal(reviewAwaitsPerson({ content: [{ type: "text", text: JSON.stringify({ reviewId: REV, outcome: "report", reportId: RID }) }] }), false);
+  assert.equal(reviewAwaitsPerson({ content: [{ type: "text", text: JSON.stringify({ reviewId: REV, outcome: "done" }) }] }), false);
+
+  const env = { CLAUDE_CODE_SESSION_ID: "s1" };
+  const fg = async () => true;
+  const report = { hook_event_name: "PostToolUse", session_id: "s1", tool_name: "mcp__parallelsandbox__sandbox_report", tool_input: { id: "box1", reportId: RID }, tool_response: [{ type: "text", text: "{}" }] };
+  // 回報已讀、信箱沒有下一則：馬上回來，不等。
+  let dir = await mailed("claude-code", "s1");
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: { hook_event_name: "SessionStart", session_id: "s1" }, err: () => {} }), 2);
+  let started = Date.now();
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: report }), 0);
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: { hook_event_name: "SessionStart", session_id: "s1", source: "resume" } }), 0);
+  assert.ok(Date.now() - started < 1500, "sandbox_report and SessionStart never wait in the foreground");
+  // 已經到的下一則照樣交出去。
+  dir = await mailed("claude-code", "s1");
+  let err = "";
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: report, err: (s) => { err = s; } }), 2);
+  assert.match(err, /sandbox_report/);
+  // 剛交件、還在等人：前景照樣等到回報進來。
+  dir = await mailed("claude-code", "s1");
+  const review = { hook_event_name: "PostToolUse", session_id: "s1", tool_name: "mcp__parallelsandbox__sandbox_review", tool_input: { id: "box1" }, tool_response: open.content };
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: review, err: () => {} }), 2);
+  // 交件結果已經帶回報：不再等下一則。
+  dir = await mailed("claude-code", "s1");
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: { hook_event_name: "SessionStart", session_id: "s1" }, err: () => {} }), 2);
+  started = Date.now();
+  const answered = { ...review, tool_response: [{ type: "text", text: JSON.stringify({ reviewId: REV, outcome: "report", reportId: RID }) }] };
+  assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: answered }), 0);
+  assert.ok(Date.now() - started < 1500);
 });
 
 test("a waiter whose host is gone takes nothing", async () => {

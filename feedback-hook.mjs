@@ -1,34 +1,47 @@
 // Host hook for App feedback (see feedback-relay.mjs). One script, three hosts:
 //   claude-code  PostToolUse / SessionStart with asyncRewake: waits in the background and
 //                wakes the idle conversation by exiting 2 with the follow-up on stderr.
+//                `claude -p "<prompt>"` runs the same hook in the foreground instead: the tool
+//                result waits for it, so there only a fresh review waits for the person.
 //   cursor       afterMCPExecution attaches the review; stop returns {followup_message}.
 //   gemini       AfterTool attaches the review; AfterAgent returns {decision:"block", reason}.
 // Cursor and Gemini have no idle wake: their end-of-turn hook holds for a bounded time right
 // after a review was requested, and otherwise hands over waiting feedback at the next turn end.
+import { execFile } from "node:child_process";
 import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { promisify } from "node:util";
 import { alive, attachReview, parentOf, defaultFeedbackDir, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, sessionKey, takeMail, ticketKey } from "./feedback-relay.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const REVIEW_TOOL = /sandbox_(review|draft|architecture|schema)$/;
 
 // sandbox_review results are MCP content; the JSON payload may sit in text blocks, nested
 // objects or a JSON string, depending on the host.
-export function reviewFromResult(value, depth = 0) {
-  if (depth > 6 || value == null) return "";
+function reviewPayload(value, depth = 0) {
+  if (depth > 6 || value == null) return null;
   if (typeof value === "string") {
     const s = value.trim();
-    try { if (s.startsWith("{") || s.startsWith("[")) return reviewFromResult(JSON.parse(s), depth + 1); } catch { /* try the embedded object below */ }
+    try { if (s.startsWith("{") || s.startsWith("[")) return reviewPayload(JSON.parse(s), depth + 1); } catch { /* try the embedded object below */ }
     // Some hosts wrap tool text, e.g. Gemini CLI's <untrusted_context>…</untrusted_context>.
     const start = s.indexOf("{"), end = s.lastIndexOf("}");
-    if (start < 0 || end <= start || (start === 0 && end === s.length - 1)) return "";
-    try { return reviewFromResult(JSON.parse(s.slice(start, end + 1)), depth + 1); } catch { return ""; }
+    if (start < 0 || end <= start || (start === 0 && end === s.length - 1)) return null;
+    try { return reviewPayload(JSON.parse(s.slice(start, end + 1)), depth + 1); } catch { return null; }
   }
-  if (Array.isArray(value)) { for (const v of value) { const r = reviewFromResult(v, depth + 1); if (r) return r; } return ""; }
+  if (Array.isArray(value)) { for (const v of value) { const r = reviewPayload(v, depth + 1); if (r) return r; } return null; }
   if (typeof value === "object") {
-    if (typeof value.reviewId === "string" && value.ok !== false && /^[A-Za-z0-9_-]{6,128}$/.test(value.reviewId)) return value.reviewId;
-    for (const v of Object.values(value)) { const r = reviewFromResult(v, depth + 1); if (r) return r; }
+    if (typeof value.reviewId === "string" && value.ok !== false && /^[A-Za-z0-9_-]{6,128}$/.test(value.reviewId)) return value;
+    for (const v of Object.values(value)) { const r = reviewPayload(v, depth + 1); if (r) return r; }
   }
-  return "";
+  return null;
+}
+
+export const reviewFromResult = (value) => reviewPayload(value)?.reviewId || "";
+
+// A review result that already carries the report (outcome "report") or ended the round leaves nothing to wait for.
+export function reviewAwaitsPerson(value) {
+  const r = reviewPayload(value);
+  return !!r && (r.outcome === undefined || r.outcome === "timed_out" || r.outcome === "wait_cancelled");
 }
 
 const parseMaybe = (v) => { if (typeof v !== "string") return v; try { return JSON.parse(v); } catch { return v; } };
@@ -40,7 +53,7 @@ export function hookInput(host, raw) {
 }
 
 export function attachFromTool({ dir, host, input }) {
-  if (!/sandbox_(review|draft|architecture|schema)$/.test(input.tool || "")) return false;
+  if (!REVIEW_TOOL.test(input.tool || "")) return false;
   const boxId = input.input?.id;
   const reviewId = reviewFromResult(input.result);
   if (typeof boxId !== "string" || !reviewId) return false;
@@ -92,6 +105,30 @@ export async function hostAncestors(ps = parentOf) {
   return chain;
 }
 
+// Print mode with a text prompt (`claude -p "…"`) runs asyncRewake hooks in the foreground; stream-json
+// input (the desktop app, SDKs) and the interactive CLI run them in the background.
+export function foregroundHookArgs(args) {
+  if (!args.some((a) => a === "-p" || a === "--print")) return false;
+  return !args.some((a, i) => a === "--input-format=stream-json" || (a === "--input-format" && args[i + 1] === "stream-json"));
+}
+
+async function commandArgs(pid) {
+  if (process.platform === "win32") return [];
+  if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+  const { stdout } = await promisify(execFile)("ps", ["-ww", "-o", "command=", "-p", String(pid)]);
+  return stdout.trim().split(/\s+/);
+}
+
+// Claude Code names its own pid in CLAUDE_PID; older versions are found among the hook's ancestors
+// (npx and a shell may sit in between).
+export async function hostRunsHookInForeground({ env = process.env, argsOf = commandArgs, ps = parentOf } = {}) {
+  const pids = [];
+  if (Number(env.CLAUDE_PID) > 1) pids.push(Number(env.CLAUDE_PID));
+  else for (let pid = process.ppid, i = 0; i < 5 && pid > 1; i++) { pids.push(pid); pid = (await ps(pid).catch(() => null))?.ppid ?? 0; }
+  for (const pid of pids) if (foregroundHookArgs(await argsOf(pid).catch(() => []))) return true;
+  return false;
+}
+
 // Cursor runs Claude Code hooks from ~/.claude/settings.json by default (without asyncRewake), and other
 // clients may import them. The Claude route acts only inside the Claude Code conversation that runs it.
 export function isClaudeCodeHook(raw, env = process.env) {
@@ -101,7 +138,7 @@ export function isClaudeCodeHook(raw, env = process.env) {
     && typeof raw.transcript_path === "string" && basename(raw.transcript_path) === `${raw.session_id}.jsonl`;
 }
 
-export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = process.env, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s) }) {
+export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = process.env, foreground = hostRunsHookInForeground, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s) }) {
   if (host === "claude-code" && !isClaudeCodeHook(raw, env)) return 0;
   const input = hookInput(host, raw);
   if (typeof input.session !== "string" || !input.session) return 0;
@@ -112,13 +149,18 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
   if (host === "claude-code") {
     // One background waiter per conversation; the next one starts at the next review/report call.
     if (!sessionExpectsFeedback({ dir, host, session: input.session })) return 0;
+    // In the foreground only a review still open for the person waits. Waiting after sandbox_report, at
+    // SessionStart or after a review that returned its report would hold that report from the conversation
+    // until the next one came: hand over a follow-up already waiting and return.
+    const opened = REVIEW_TOOL.test(input.tool || "") && reviewAwaitsPerson(input.result);
+    const waitMs = opened || !(await foreground({ env })) ? 7 * 24 * 3600_000 : 0;
     const run = privateDir(paths(dir).run);
     const lock = join(run, `waiter-${sessionKey(host, input.session)}.pid`);
     const holder = Number(orNull(() => readFileSync(lock, "utf8")) || 0);
     if (holder && holder !== process.pid && alive(holder)) return 0;
     writeFileSync(lock, String(process.pid), { mode: 0o600 });
     try {
-      const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + 7 * 24 * 3600_000, by: `claude:${process.pid}`, ancestors: await hostAncestors() });
+      const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + waitMs, by: `claude:${process.pid}`, ancestors: await hostAncestors() });
       if (!mail) return 0;
       err(mail.text + "\n");
       return 2; // asyncRewake: wakes the idle conversation, or queues behind the running turn.

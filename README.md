@@ -180,7 +180,7 @@ receipt read. Each host only differs in how the follow-up enters the conversatio
 | Host | Hooks | How the conversation receives it |
 |---|---|---|
 | Codex (Desktop, CLI, IDE) | none | The thread comes from Codex's tool-call metadata; the relay runs the host's own `codex queue --thread`. Idle threads start a turn; busy threads get it after the current turn. |
-| Claude Code (CLI, desktop) | `install claude-code` | A background `asyncRewake` hook wakes the idle session; a busy session reads it after its current tool call. Reopening the session hands over anything that arrived while it was closed. |
+| Claude Code (CLI, desktop) | `install claude-code` | A background `asyncRewake` hook wakes the idle session; a busy session reads it after its current tool call. Reopening the session hands over anything that arrived while it was closed. `claude -p "<prompt>"` runs the hook in the foreground, so there the call that opens a review waits for the report, and `sandbox_report` returns at once. |
 | Cursor | `install cursor` | `afterMCPExecution` attaches the review; the `stop` hook returns it as `followup_message`. Not yet verified end to end with a real Cursor agent. |
 | Gemini CLI | `install gemini` | `AfterTool` attaches the review; the `AfterAgent` hook returns it with `decision: "block"`. |
 
