@@ -265,10 +265,40 @@ test("an explicitly supplied host UI request handler can answer its own approval
   assert.deepEqual(f.host.pendingHostRequests(), []);
 });
 
-test("design tools bind trusted parent session metadata like sandbox_review", () => {
-  const ticket = { boxId: "box-1", reviewId: "dsn_1", token: "ticket-secret" };
+// 設計的一版不屬於箱子：工具沒給箱子 id、結果沒有 id，照樣綁、領、只用 reportId 讀、ack。
+const designHook = (token = "ticket-secret", toolInput = {}, tool = "sandbox_draft") => ({ hook_event_name: "PostToolUse", tool_name: `mcp__parallelsandbox__${tool}`, session_id: "original-thread", cwd: "/work/project", tool_input: { topic: "checkout", ...toolInput }, tool_response: { _meta: { psbxCodexFeedback: { token } }, content: [{ type: "text", text: JSON.stringify({ ok: true, designId: "dsg_1", reviewId: "dsn_1", kind: "draft", topic: "checkout", version: 1 }) }] } });
+
+test("design tools bind trusted parent session metadata like sandbox_review, with or without a box id", () => {
+  const ticket = { reviewId: "dsn_1", token: "ticket-secret" };
   for (const tool of ["sandbox_draft", "sandbox_architecture", "sandbox_schema"]) {
-    const value = reviewHookBinding({ ...hook("dsn_1"), tool_name: `mcp__parallelsandbox__${tool}` }, ticket);
+    const value = reviewHookBinding(designHook("ticket-secret", {}, tool), ticket);
     assert.equal(value?.sessionId, "original-thread", tool);
+    assert.equal(Object.hasOwn(value, "boxId"), false, tool);
   }
+  assert.equal(reviewHookBinding(designHook("ticket-secret", { id: "box-1" }), ticket)?.sessionId, "original-thread", "a box the tool was given does not change the design binding");
+  assert.throws(() => reviewHookBinding(designHook(), { ...ticket, reviewId: "dsn_2" }), /does not match/);
+});
+
+test("a design version without a box binds, claims, reads by reportId alone and acknowledges", async (t) => {
+  const registrations = [], acks = [], reads = [];
+  const event = { eventId: "design-event", reportId: "report-d", designId: "dsg_1", reviewId: "dsn_1", leaseToken: "lease-d", leaseExpiresAt: new Date(Date.now() + 120_000).toISOString() };
+  const f = await coordinator(t, {
+    authorizedFetch: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (url.endsWith("/claim")) return response({ events: registrations.some((r) => r.reviewId === "dsn_1") && !acks.length ? [event] : [] });
+      if (url.endsWith("/ack")) { acks.push(body); return response({ ok: true }); }
+      registrations.push(body);
+      return response({ ok: true });
+    },
+    callRemoteReport: async ({ signal, ...args }) => { reads.push(args); return report; },
+  });
+  const tracked = await f.feedback.trackReview({ reviewId: "dsn_1" });
+  assert.deepEqual(await runCodexFeedbackHook(designHook(tracked.hookMeta.token), { stateDir: f.stateDir }), { bound: true, reviewId: "dsn_1" });
+  await waitUntil(() => acks.length === 1);
+  const design = registrations.find((r) => r.reviewId === "dsn_1");
+  assert.deepEqual(design, { consumerId: registrations.find((r) => r.reviewId === "review-1").consumerId, reviewId: "dsn_1", host: "codex", capability: "codex/turn-start-tool-output" });
+  assert.deepEqual(reads, [{ reportId: "report-d" }]);
+  assert.deepEqual(acks[0], { eventId: "design-event", reportId: "report-d", leaseToken: "lease-d", state: "host_accepted" });
+  assert.equal(f.deliveries.length, 1);
+  await assert.rejects(f.feedback.trackReview({ reviewId: "review-without-box" }), /boxId/, "a review card still needs its box");
 });

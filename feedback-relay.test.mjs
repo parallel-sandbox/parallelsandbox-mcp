@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { once as onceEvent } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { attachReview, codexThreadId, createFeedbackRoute, followUpText, hostCodexCli, mailFor, paths, readJson, runRelay, takeMail, ticketKey, writeJson } from "./feedback-relay.mjs";
+import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, followUpText, hostCodexCli, mailFor, paths, readJson, runRelay, takeMail, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
 import { foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
 import { hooksInstalled, hostConfig, hostFromClient, install, installNote, mergeHooks, reviewInstallNote, selfCommand, setupInstructions } from "./feedback-install.mjs";
 
@@ -15,9 +17,10 @@ const route = (dir, over = {}) => createFeedbackRoute({ apiUrl: "https://api.tes
   authorizedFetch: async () => json(200, {}), findCli: async () => "/abs/codex", spawnRelay: async () => ({ running: true }), ...over });
 const credOf = (dir, box = "box1", review = "rev1") => readJson(join(paths(dir).tickets, `${ticketKey(box, review)}.json`)).credKey;
 
-// A fake backend: one report waits on each bound review until acknowledged.
-function backend(reports) {
-  const calls = [], bound = new Map(), acked = new Map();
+// A fake backend: one report waits on each bound review until acknowledged. Conversation status
+// (host_inactive / host_active) is recorded apart: it acknowledges nothing.
+function backend(reports, { hostStatus = true } = {}) {
+  const calls = [], bound = new Map(), acked = new Map(), host = [];
   let lease = 0;
   const fetchImpl = async (url, init) => {
     const body = JSON.parse(init.body), path = new URL(url).pathname, agent = init.headers["X-Psbx-Agent"];
@@ -26,12 +29,17 @@ function backend(reports) {
     const consumer = decodeURIComponent(path.split("/")[3]);
     if (path.endsWith("/claim")) {
       const r = reports.find((x) => bound.get(x.reviewId) === consumer && !acked.has(x.reportId));
-      return json(200, { events: r ? [{ eventId: `ev-${r.reportId}`, boxId: r.boxId, reviewId: r.reviewId, reportId: r.reportId, leaseToken: `l${++lease}` }] : [] });
+      // A review card's event carries its box; a design version's carries its design instead.
+      return json(200, { events: r ? [{ eventId: `ev-${r.reportId}`, ...(r.designId ? { designId: r.designId } : { boxId: r.boxId }), reviewId: r.reviewId, reportId: r.reportId, leaseToken: `l${++lease}` }] : [] });
+    }
+    if (path.endsWith("/ack") && body.state.startsWith("host_") && body.state !== "host_accepted") {
+      if (!hostStatus) return json(400, { error: "state must be host_accepted or read" });
+      host.push([body.reportId, body.state, body.leaseToken]); return json(200, { ok: true });
     }
     if (path.endsWith("/ack")) { acked.set(body.reportId, body.state); return json(200, { ok: true }); }
     return json(404, {});
   };
-  return { fetchImpl, calls, bound, acked };
+  return { fetchImpl, calls, bound, acked, host };
 }
 
 test("thread comes only from Codex tools/call _meta", () => {
@@ -91,6 +99,23 @@ test("hook host: attached review is mailed, taken once, then acknowledged", asyn
   assert.equal(be.acked.get(RID), "host_accepted");
 });
 
+test("Claude Code: the conversation's waiter attaches the other designs its adapter drew in the same turn", async () => {
+  const dir = tmp();
+  const r = route(dir);
+  await r.trackReview({ reviewId: "dsn_arch", clientName: "claude-code" });
+  await r.trackReview({ reviewId: "dsn_draft", clientName: "claude-code" });
+  assert.equal(attachSiblings({ dir, host: "claude-code", session: "S1" }), 0, "nothing attached yet: no conversation is known");
+  assert.equal(attachReview({ dir, host: "claude-code", session: "S1", reviewId: "dsn_arch" }), true);
+  assert.equal(attachSiblings({ dir, host: "cursor", session: "S1" }), 0, "only Claude Code has one adapter per conversation");
+  assert.equal(attachSiblings({ dir, host: "claude-code", session: "S1" }), 1);
+  assert.equal(attachSiblings({ dir, host: "claude-code", session: "S1" }), 0, "attached once");
+  assert.equal(attachReview({ dir, host: "claude-code", session: "S2", reviewId: "dsn_draft" }), false, "the draft belongs to S1 now");
+  const be = backend([{ designId: "dsg_draft", reviewId: "dsn_draft", reportId: RID }]);
+  await runRelay({ dir, credKey: credOf(dir, undefined, "dsn_draft"), fetchImpl: be.fetchImpl, once: true });
+  const [entry] = mailFor({ dir, host: "claude-code", session: "S1" });
+  assert.match(entry.mail.text, /design version dsn_draft/);
+});
+
 test("a failed acknowledgement never queues the same Codex report twice", async () => {
   const dir = tmp();
   await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
@@ -131,6 +156,88 @@ test("a report read before the relay acknowledged acceptance still becomes read"
   assert.equal(be.acked.get(RID), "read", "a re-claimed read report is acknowledged read, never downgraded");
 });
 
+test("Claude Code: a follow-up no waiter takes is reported host_inactive once; resuming the conversation hands it over, then accepted and read", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: "rev1" });
+  const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]);
+  const relay = (over = {}) => runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: () => {}, ...over });
+  await relay();
+  assert.deepEqual(be.host, [], "a waiter may still be starting: nothing is reported within the grace period");
+  // Claude Desktop stopped the idle session: its CLI and waiter were killed, leaving a stale pid file.
+  writeFileSync(waiterPidFile(dir, "claude-code", "S1"), "999999");
+  await relay({ hostGraceMs: 0 });
+  assert.deepEqual(be.host.map(([report, state]) => [report, state]), [[RID, "host_inactive"]]);
+  assert.equal(be.host[0][2], "l2", "reported with the current lease");
+  assert.equal(be.acked.size, 0, "a conversation that is not running received nothing");
+  assert.equal(mailFor({ dir, host: "claude-code", session: "S1" }).length, 1, "the follow-up stays for that conversation");
+  await relay({ hostGraceMs: 0 });
+  assert.equal(be.host.length, 1, "reported once, also across a renewed lease");
+  // The person sends that conversation a message: Claude Desktop resumes it and SessionStart hands the follow-up over.
+  let err = "";
+  assert.equal(await runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "S1" }, foreground: async () => false,
+    raw: { hook_event_name: "SessionStart", source: "resume", session_id: "S1" }, err: (s) => { err += s; } }), 2);
+  assert.match(err, /sandbox_report tool/);
+  assert.equal(existsSync(waiterPidFile(dir, "claude-code", "S1")), false, "the waiter cleaned up after handing it over");
+  await relay({ hostGraceMs: 0 });
+  assert.equal(be.acked.get(RID), "host_accepted");
+  assert.equal(be.host.length, 1, "a follow-up that was handed over is acknowledged, not reported");
+  const reads = [];
+  assert.equal(await route(dir, { authorizedFetch: async (url, init) => { reads.push(JSON.parse(init.body).state); return json(200, {}); } }).onReportRead({ boxId: "box1", reportId: RID }), true);
+  assert.deepEqual(reads, ["read"]);
+});
+
+test("a live waiter is never reported; a conversation running again before it takes the follow-up withdraws host_inactive", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: "rev1" });
+  const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]);
+  let running = true;
+  const asked = [];
+  const relay = () => runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: () => {}, hostGraceMs: 0,
+    waiting: async ({ host, session }) => { asked.push([host, session]); return running; } });
+  await relay();
+  assert.deepEqual(be.host, []);
+  assert.deepEqual(asked, [["claude-code", "S1"]]);
+  running = false;
+  await relay();
+  running = true;
+  await relay();
+  assert.deepEqual(be.host.map(([, state]) => state), ["host_inactive", "host_active"]);
+  // Hosts without a background waiter (Cursor, Gemini CLI) hand over at their next turn end and are never reported.
+  const cursorDir = await mailed("cursor", "c1", { hostGraceMs: 0, waiting: async () => false });
+  assert.equal(readdirSync(paths(cursorDir).journal).length, 1);
+});
+
+test("a server without conversation status keeps delivering, and is asked once", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: "rev1" });
+  const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }], { hostStatus: false });
+  const logs = [];
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: (...a) => logs.push(a.join(" ")), hostGraceMs: 0, waiting: async () => false });
+  assert.equal(logs.filter((l) => /does not take conversation status/.test(l)).length, 1);
+  takeMail(mailFor({ dir, host: "claude-code", session: "S1" })[0], "w");
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: () => {} });
+  assert.equal(be.acked.get(RID), "host_accepted");
+});
+
+test("a waiter counts only while its pid still runs this package's hook", async (t) => {
+  const dir = tmp();
+  const ask = () => waiterRunning({ dir, host: "claude-code", session: "S1" });
+  assert.equal(await ask(), false, "no waiter yet");
+  mkdirSync(paths(dir).run, { recursive: true });
+  writeFileSync(waiterPidFile(dir, "claude-code", "S1"), "999999");
+  assert.equal(await ask(), false, "killed with its CLI, pid file left behind");
+  writeFileSync(waiterPidFile(dir, "claude-code", "S1"), String(process.pid));
+  assert.equal(await ask(), false, "the pid now belongs to another program");
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)", "hook", "--host", "claude-code"], { stdio: "ignore" });
+  t.after(() => child.kill());
+  await onceEvent(child, "spawn");
+  writeFileSync(waiterPidFile(dir, "claude-code", "S1"), String(child.pid));
+  assert.equal(await ask(), true);
+});
+
 test("hook input: review id is found in each host's result shape", () => {
   const payload = JSON.stringify({ ok: true, reviewId: "b9dceef8e5d99c4d2607", appURL: "x" });
   assert.equal(reviewFromResult([{ type: "text", text: payload }]), "b9dceef8e5d99c4d2607");
@@ -142,11 +249,13 @@ test("hook input: review id is found in each host's result shape", () => {
   assert.deepEqual([c.session, c.input.id, reviewFromResult(c.result)], ["c1", "box1", "b9dceef8e5d99c4d2607"]);
 });
 
-async function mailed(host, session) {
+async function mailed(host, session, over = {}) {
   const dir = tmp();
   await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: host });
   attachReview({ dir, host, session, boxId: "box1", reviewId: "rev1" });
-  await runRelay({ dir, credKey: credOf(dir), fetchImpl: backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]).fetchImpl, once: true });
+  const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]);
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, ...over });
+  assert.deepEqual(be.host, [], `${host} is never reported`);
   return dir;
 }
 
@@ -257,7 +366,7 @@ test("usage note appears only for a hook host without hooks, and disappears afte
   const note = installNote("claude-code", { home, env });
   assert.match(note.usage, /ask them now, in this conversation, whether you may run this once: .*install claude-code/);
   assert.match(reviewInstallNote("claude-code", { id: "b1", reviewId: "r1" }, { home, env }), /sandbox_review with \{"id":"b1","reviewId":"r1","waitSec":0\}/);
-  const designNote = reviewInstallNote("claude-code", { id: "b1", reviewId: "dsn_abc" }, { home, env });
+  const designNote = reviewInstallNote("claude-code", { reviewId: "dsn_abc" }, { home, env });
   assert.doesNotMatch(designNote, /call sandbox_review with/, "a design version cannot be re-registered through sandbox_review");
   assert.match(designNote, /read it with sandbox_report\. Versions you draw after the install return here on their own\./);
   install("claude-code", { home, env, command: "psbx" });
@@ -267,7 +376,7 @@ test("usage note appears only for a hook host without hooks, and disappears afte
   assert.equal(installNote("gemini-cli-mcp-client", { home, env }).host, "gemini");
   assert.match(setupInstructions({ home, env }), /Gemini CLI: .*install gemini/);
   assert.match(reviewInstallNote("gemini-cli-mcp-client", { id: "b1", reviewId: "r1" }, { home, env }), /not routed automatically in this run/);
-  assert.match(reviewInstallNote("gemini-cli-mcp-client", { id: "b1", reviewId: "dsn_abc" }, { home, env }), /Versions drawn after Gemini CLI restarts return here on their own\./);
+  assert.match(reviewInstallNote("gemini-cli-mcp-client", { reviewId: "dsn_abc" }, { home, env }), /Versions drawn after Gemini CLI restarts return here on their own\./);
   assert.doesNotMatch(setupInstructions({ home, env }), /Claude Code:/);
   install("gemini", { home, env, command: "psbx" });
   assert.equal(installNote("gemini-cli-mcp-client", { home, env }), null);
@@ -313,13 +422,67 @@ test("design tools route feedback like sandbox_review, and older hook installs a
   assert.equal(hooksInstalled("claude-code", { home, env }), true);
 });
 
-test("a drawn design version attaches the conversation the same way a review does", async () => {
+// 設計的一版不屬於箱子：工具沒給箱子 id、結果也沒有 id，照樣寫票、綁定、領取、叫醒，讀完回 read。
+const DESIGN = { ok: true, designId: "dsg_abc", reviewId: "dsn_abc123", kind: "draft", topic: "checkout", version: 2, appUrl: "https://app.test/design/dsg_abc" };
+const designResult = (extra = {}) => ({ content: [{ type: "text", text: JSON.stringify({ ...DESIGN, ...extra }) }] });
+
+test("a drawn design version attaches the conversation the same way a review does, with or without a box id", async () => {
   const { attachFromTool } = await import("./feedback-hook.mjs");
   const dir = tmp();
-  await route(dir).trackReview({ boxId: "box-1", reviewId: "dsn_abc123", clientName: "cursor-vscode" });
-  const result = { content: [{ type: "text", text: JSON.stringify({ ok: true, id: "box-1", reviewId: "dsn_abc123", designId: "dsn_abc123", version: 2 }) }] };
-  assert.ok(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_draft", input: { id: "box-1" }, result } }));
-  assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_status", input: { id: "box-1" }, result } }), false);
+  await route(dir).trackReview({ reviewId: "dsn_abc123", clientName: "cursor-vscode" });
+  assert.ok(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_draft", input: { topic: "checkout" }, result: designResult() } }));
+  assert.ok(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_draft", input: { id: "box-1", topic: "checkout" }, result: designResult({ boxId: "box-1" }) } }),
+    "a box the tool was given is only an association: the same design ticket");
+  assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s2", tool: "mcp__parallelsandbox__sandbox_draft", input: {}, result: designResult() } }), false, "one design version, one conversation");
+  assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_status", input: { id: "box-1" }, result: designResult() } }), false);
+  // A review card still needs its box.
+  await route(dir).trackReview({ boxId: "box-1", reviewId: "rev-card", clientName: "cursor-vscode" });
+  assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_review", input: {}, result: { content: [{ type: "text", text: JSON.stringify({ ok: true, reviewId: "rev-card" }) }] } } }), false);
+});
+
+test("design feedback without a box: binds without boxId, wakes with the design text, and reading by reportId acknowledges read", async () => {
+  const dir = tmp();
+  const out = await route(dir).trackReview({ reviewId: "dsn_abc123", clientName: "claude-code" });
+  assert.equal(out.automatic, "when_hooks_installed");
+  const ticket = readJson(join(paths(dir).tickets, `${ticketKey(undefined, "dsn_abc123")}.json`));
+  assert.equal("boxId" in ticket, false);
+  assert.equal(ticketKey("box-1", "dsn_abc123"), ticketKey(undefined, "dsn_abc123"), "a design ticket never depends on a box");
+  const claude = { session_id: "S1", transcript_path: "/x/S1.jsonl" };
+  assert.equal(await runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "S1" }, foreground: async () => true,
+    raw: { ...claude, hook_event_name: "PostToolUse", tool_name: "mcp__parallelsandbox__sandbox_architecture", tool_input: { topic: "checkout" }, tool_response: designResult({ outcome: "report" }) } }), 0);
+  const be = backend([{ designId: "dsg_abc", reviewId: "dsn_abc123", reportId: RID }]);
+  await runRelay({ dir, credKey: ticket.credKey, fetchImpl: be.fetchImpl, once: true, print: () => {} });
+  assert.deepEqual(be.calls[0].body, { consumerId: be.bound.get("dsn_abc123"), reviewId: "dsn_abc123", host: "claude-code", capability: "claude-code/async-rewake" });
+  const [entry] = mailFor({ dir, host: "claude-code", session: "S1" });
+  assert.equal("boxId" in entry.mail, false);
+  assert.equal(entry.mail.text.split("\n")[0], `[ParallelSandbox] The person sent feedback in the ParallelSandbox app on design version dsn_abc123. Call the parallelsandbox sandbox_report tool with exactly {"reportId":"${RID}"} to read it, change what they asked, then call the same design tool again with the same topic for the next version.`);
+  let err = "";
+  assert.equal(await runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "S1" }, foreground: async () => false,
+    raw: { ...claude, hook_event_name: "SessionStart", source: "resume" }, err: (s) => { err += s; } }), 2);
+  assert.match(err, /design version dsn_abc123/);
+  await runRelay({ dir, credKey: ticket.credKey, fetchImpl: be.fetchImpl, once: true, print: () => {} });
+  assert.equal(be.acked.get(RID), "host_accepted");
+  const reads = [];
+  const reader = route(dir, { authorizedFetch: async (url, init) => { reads.push(JSON.parse(init.body).state); return json(200, {}); } });
+  assert.equal(await reader.onReportRead({ reportId: "other" }), false);
+  assert.equal(await reader.onReportRead({ reportId: RID }), true, "a design report is read with just its reportId");
+  assert.deepEqual(reads, ["read"]);
+});
+
+test("a design report read with a box id is the same report; a review card's report still needs its box", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ reviewId: "dsn_abc123", clientName: "codex-mcp-client", meta: { threadId: T } });
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
+  const RID2 = "22222222-2222-3333-4444-555555555555";
+  const be = backend([{ designId: "dsg_abc", reviewId: "dsn_abc123", reportId: RID }, { boxId: "box1", reviewId: "rev1", reportId: RID2 }]);
+  const queued = [];
+  for (let i = 0; i < 2; i++) await runRelay({ dir, credKey: credOf(dir, "box1", "rev1"), fetchImpl: be.fetchImpl, once: true, print: () => {}, queue: async (t, msg) => { queued.push(msg); return `q${queued.length}`; } });
+  assert.ok(queued.some((m) => m.includes(`exactly {"reportId":"${RID}"}`)), "the design follow-up reads without a box");
+  assert.ok(queued.some((m) => m.includes(`exactly {"id":"box1","reportId":"${RID2}"}`)), "the review follow-up still reads with its box");
+  const reader = route(dir);
+  assert.equal(await reader.onReportRead({ boxId: "box-anything", reportId: RID }), true);
+  assert.equal(await reader.onReportRead({ reportId: RID2 }), false);
+  assert.equal(await reader.onReportRead({ boxId: "box1", reportId: RID2 }), true);
 });
 
 // ---------- one review that cannot be bound never holds up the others ----------

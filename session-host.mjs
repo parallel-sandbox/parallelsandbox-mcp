@@ -7,6 +7,7 @@ import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { isDesignVersion, reportArgs, reviewBox } from "./feedback-relay.mjs";
 import { OAuthSession } from "./oauth.mjs";
 
 const drivers = {
@@ -295,21 +296,23 @@ export class SessionHost {
       }
       if (req.url === "/review") {
         if (!this.busy || body.generation !== this.generation || !this.state.sessionId) return respond(409, {error: "Review does not belong to this native turn"});
-        if (!safeID(body.boxId) || !safeID(body.reviewId)) return respond(400, {error: "Invalid review identity"});
+        // A design version (dsn_…) is bound without a box.
+        const boxId = reviewBox(body.boxId, body.reviewId);
+        if (!safeID(body.reviewId) || (!isDesignVersion(body.reviewId) && !safeID(boxId))) return respond(400, {error: "Invalid review identity"});
         const consumerId = this.consumerId();
-        await this.post("/v1/feedback-consumers", {consumerId, boxId: body.boxId, reviewId: body.reviewId,
+        await this.post("/v1/feedback-consumers", {consumerId, ...(boxId ? {boxId} : {}), reviewId: body.reviewId,
           host: this.config.provider, capability: "native-session-resume-v1"});
-        if (!this.state.reviews.some((v) => v.boxId === body.boxId && v.reviewId === body.reviewId)) {
-          this.state.reviews.push({boxId: body.boxId, reviewId: body.reviewId, sessionId: this.state.sessionId, consumerId});
+        if (!this.state.reviews.some((v) => v.boxId === boxId && v.reviewId === body.reviewId)) {
+          this.state.reviews.push({...(boxId ? {boxId} : {}), reviewId: body.reviewId, sessionId: this.state.sessionId, consumerId});
         }
         this.persist();
-        this.audit("review_bound", {boxId: body.boxId, reviewId: body.reviewId, sessionId: this.state.sessionId});
+        this.audit("review_bound", {...(boxId ? {boxId} : {}), reviewId: body.reviewId, sessionId: this.state.sessionId});
         return respond(200, {registered: true, provider: this.config.provider, sessionId: this.state.sessionId});
       }
       if (req.url === "/report-read") {
         const record = this.activeDelivery;
         if (!this.busy || body.generation !== this.generation || !record ||
-            body.boxId !== record.boxId || body.reportId !== record.reportId || record.sessionId !== this.state.sessionId) {
+            (record.boxId && body.boxId !== record.boxId) || body.reportId !== record.reportId || record.sessionId !== this.state.sessionId) {
           return respond(409, {error: "Report does not belong to the active original feedback turn"});
         }
         record.reportReadAt = stamp();
@@ -427,7 +430,7 @@ export class SessionHost {
   }
 
   async readReport(event) {
-    this.remote ||= new Client({name: "parallelsandbox-feedback-host", version: "0.5.3"});
+    this.remote ||= new Client({name: "parallelsandbox-feedback-host", version: "0.6.0"});
     if (!this.remoteConnected) {
       const transport = new StreamableHTTPClientTransport(new URL(this.config.mcpUrl), {
         requestInit: {headers: this.headers}, fetch: (url, init) => this.fetch(url, init),
@@ -435,7 +438,7 @@ export class SessionHost {
       await this.remote.connect(transport);
       this.remoteConnected = true;
     }
-    const result = await this.remote.callTool({name: "sandbox_report", arguments: {id: event.boxId, reportId: event.reportId}}, undefined, {timeout: 60_000});
+    const result = await this.remote.callTool({name: "sandbox_report", arguments: reportArgs(event)}, undefined, {timeout: 60_000});
     if (result.isError || !result.content?.length) throw new Error("Complete feedback report could not be read");
     // Keep every returned block: annotated images, timed transcripts and recording
     // URLs accompany the text. The native model sees the complete durable report.
@@ -479,7 +482,7 @@ export class SessionHost {
           if (record?.status === "completed") { await this.ack(event); continue; }
           if (record?.status === "uncertain") continue;
           const result = await this.readReport(event);
-          record = {eventId: event.eventId, boxId: event.boxId, reviewId: event.reviewId, reportId: event.reportId,
+          record = {eventId: event.eventId, ...(event.boxId ? {boxId: event.boxId} : {}), reviewId: event.reviewId, reportId: event.reportId,
             sessionId: binding.sessionId, status: "prepared", preparedAt: stamp(),
             retryRequestedAt: record?.retryRequestedAt,
             reportSHA256: createHash("sha256").update(JSON.stringify(result)).digest("hex")};
@@ -491,7 +494,7 @@ export class SessionHost {
           // media, and can mistake the delivery event for the person's content.
           // The exact MCP read supplies all blocks in the provider's protocol.
           const retryNote = record.retryRequestedAt ? "This is an explicit retry after an interrupted delivery. Check the original history and work already done before continuing; do not repeat completed actions. " : "";
-          const prompt = `${retryNote}A person submitted new feedback for this original conversation. First call the parallelsandbox sandbox_report tool with exactly ${JSON.stringify({id: event.boxId, reportId: event.reportId})}. The notification contains no feedback content. Read the tool's complete result, including all text, annotated images, recording metadata and timed transcripts, then handle the person's request in this same conversation. Do not substitute a report from earlier history. Acknowledgement requires this exact report tool call and a successful completed turn.`;
+          const prompt = `${retryNote}A person submitted new feedback for this original conversation. First call the parallelsandbox sandbox_report tool with exactly ${JSON.stringify(reportArgs(event))}. The notification contains no feedback content. Read the tool's complete result, including all text, annotated images, recording metadata and timed transcripts, then handle the person's request in this same conversation. Do not substitute a report from earlier history. Acknowledgement requires this exact report tool call and a successful completed turn.`;
           const turn = await this.runTurn(prompt, record);
           if (turn.status === "completed") await this.ack(event);
         }

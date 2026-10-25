@@ -119,6 +119,70 @@ test("an idle supervisor can recover a Unix socket left by a dead process", asyn
   } finally { dead?.kill("SIGKILL"); await stop(host); await fs.rm(config.stateDir, { recursive: true, force: true }); }
 });
 
+// 設計的一版不屬於箱子：/review 不帶 boxId 也能綁，領到的設計事件只用 reportId 讀，讀完回 read。
+// The native turn is a stub here; only the supervisor's binding, claim, report read and ACK are exercised.
+test("a design version binds, delivers and acknowledges without a box id", async () => {
+  const config = await configuration("design");
+  const requests = [];
+  const event = {eventId: "design-event", reportId: "report-design", designId: "dsg_one", reviewId: "dsn_one", leaseToken: "lease-design"};
+  const api = createServer(async (req, res) => {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    requests.push({path: req.url, body: JSON.parse(raw || "{}")});
+    const bound = requests.some((r) => r.path === "/v1/feedback-consumers" && r.body.reviewId === "dsn_one");
+    const acked = requests.some((r) => r.path.endsWith("/ack"));
+    res.writeHead(200, {"content-type": "application/json"});
+    res.end(JSON.stringify(req.url.endsWith("/claim") ? {events: bound && !acked ? [event] : []} : {ok: true}));
+  });
+  await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+  config.apiUrl = `http://127.0.0.1:${api.address().port}`;
+  const previousKey = process.env.PARALLELSANDBOX_API_KEY;
+  let host;
+  try {
+    process.env.PARALLELSANDBOX_API_KEY = "design-contract-local-only";
+    host = new SessionHost(config);
+  } finally {
+    if (previousKey === undefined) delete process.env.PARALLELSANDBOX_API_KEY;
+    else process.env.PARALLELSANDBOX_API_KEY = previousKey;
+  }
+  try {
+    await host.start();
+    const reads = [], prompts = [];
+    host.remote = {callTool: async ({name, arguments: args}) => { reads.push([name, args]); return {content: [{type: "text", text: JSON.stringify({ok: true, reportId: args.reportId, fromHuman: []})}]}; }, close: async () => {}};
+    host.remoteConnected = true;
+    const generation = randomBytes(16).toString("hex");
+    host.runTurn = async (prompt, record) => {
+      prompts.push(prompt);
+      Object.assign(host, {busy: true, generation, activeDelivery: record});
+      try { assert.deepEqual(await sessionRequest(config.socketPath, config.token, "/report-read", {reportId: record.reportId, generation}), {read: true}); }
+      finally { Object.assign(host, {busy: false, generation: "", activeDelivery: null}); }
+      record.status = "completed";
+      return {status: "completed"};
+    };
+    // The native turn that drew the version registers it; a review card still needs its box.
+    Object.assign(host, {busy: true, generation});
+    host.state.sessionId = "native-session-design";
+    await assert.rejects(sessionRequest(config.socketPath, config.token, "/review", {reviewId: "review-card", generation}), /Invalid review identity/);
+    assert.equal((await sessionRequest(config.socketPath, config.token, "/review", {reviewId: "dsn_one", generation})).registered, true);
+    Object.assign(host, {busy: false, generation: ""});
+    const deadline = Date.now() + 5_000;
+    while (host.state.deliveries["design-event"]?.status !== "acknowledged") {
+      if (Date.now() > deadline) throw new Error(`design delivery did not finish: ${JSON.stringify(host.state)}`);
+      await delay(20);
+    }
+    assert.deepEqual(requests.find((r) => r.path === "/v1/feedback-consumers").body,
+      {consumerId: host.consumerId(), reviewId: "dsn_one", host: "claude-code", capability: "native-session-resume-v1"});
+    assert.deepEqual(reads, [["sandbox_report", {reportId: "report-design"}]]);
+    assert.match(prompts[0], /exactly \{"reportId":"report-design"\}/);
+    assert.deepEqual(requests.find((r) => r.path.endsWith("/ack")).body, {eventId: "design-event", reportId: "report-design", leaseToken: "lease-design", state: "read"});
+    assert.equal(Object.hasOwn(host.state.reviews[0], "boxId"), false);
+  } finally {
+    await stop(host);
+    await new Promise((resolve) => api.close(resolve));
+    await fs.rm(config.stateDir, {recursive: true, force: true});
+  }
+});
+
 test("recovery preserves an interrupted accepted message as explicitly retryable uncertainty", async () => {
   const config = await configuration("interrupted-input");
   let host = new SessionHost(config);

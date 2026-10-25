@@ -118,8 +118,9 @@ export function installNote(clientName, opts = {}) {
 
 // The same step for a review that already exists. Claude Code and Cursor reload hooks while running;
 // Gemini CLI reads them only when it starts.
-// A design version (sandbox_draft／sandbox_architecture／sandbox_schema, id dsn_…) is not a review card:
-// sandbox_review cannot re-register it, so only versions drawn after the install return on their own.
+// id is the box of a review card. A design version (sandbox_draft／sandbox_architecture／sandbox_schema, id dsn_…)
+// has no box and is not a review card: sandbox_review cannot re-register it, so only versions drawn after the install
+// return on their own.
 export function reviewInstallNote(clientName, { id, reviewId }, opts = {}) {
   const note = installNote(clientName, opts);
   if (!note) return null;

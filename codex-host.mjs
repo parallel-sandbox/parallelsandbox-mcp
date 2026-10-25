@@ -7,13 +7,15 @@ import { lstat, mkdir, open, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { isDesignVersion, reportArgs, reviewBox } from "./feedback-relay.mjs";
 
 export const CODEX_REVIEW_TOOLS = Object.freeze(["sandbox_review", "sandbox_draft", "sandbox_architecture", "sandbox_schema"]
   .flatMap((tool) => [`mcp__parallelsandbox__${tool}`, `mcp__parallelsandbox-mcp__${tool}`]));
 export const CODEX_FEEDBACK_CAPABILITY = "codex/turn-start-tool-output";
 export const defaultCodexStateDir = () => join(homedir(), ".cache", "parallelsandbox", "codex-feedback");
 const hash = (value) => createHash("sha256").update(value).digest("hex");
-const reviewKey = ({ boxId, reviewId }) => hash(JSON.stringify([boxId, reviewId]));
+// A design version (dsn_…) has no box: its key, binding and report read go by reviewId alone.
+const reviewKey = ({ boxId, reviewId }) => hash(JSON.stringify([reviewBox(boxId, reviewId) ?? "", reviewId]));
 const sleep = (ms, signal) => new Promise((done) => {
   if (signal?.aborted) return done();
   const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); done(); };
@@ -68,9 +70,9 @@ export function reviewHookBinding(input, ticket, toolNames = CODEX_REVIEW_TOOLS)
   if (input.tool_response?._meta?.psbxCodexFeedback?.token !== ticket.token) return null;
   const payload = resultPayload(input.tool_response);
   if (input.tool_response?.isError || !payload || payload.ok === false) return null;
-  if (input.tool_input?.id !== ticket.boxId || payload.reviewId !== ticket.reviewId) throw new Error("PostToolUse review does not match its binding ticket");
+  if (reviewBox(input.tool_input?.id, payload.reviewId) !== ticket.boxId || payload.reviewId !== ticket.reviewId) throw new Error("PostToolUse review does not match its binding ticket");
   if (payload.id !== undefined && payload.id !== ticket.boxId) throw new Error("PostToolUse box does not match its binding ticket");
-  return { boxId: ticket.boxId, reviewId: ticket.reviewId, sessionId: nonempty(input.session_id, "PostToolUse session_id"), cwd: nonempty(input.cwd, "PostToolUse cwd"), token: ticket.token };
+  return { ...(ticket.boxId ? { boxId: ticket.boxId } : {}), reviewId: ticket.reviewId, sessionId: nonempty(input.session_id, "PostToolUse session_id"), cwd: nonempty(input.cwd, "PostToolUse cwd"), token: ticket.token };
 }
 
 // Codex 0.159.2's non-experimental TurnToolOutput schema uses Responses content types.
@@ -185,9 +187,9 @@ export async function connectCodexHost({ cliPath, socketPath, signal, timeoutMs 
 export async function writeCodexHookBinding(input, { stateDir = defaultCodexStateDir(), toolNames = CODEX_REVIEW_TOOLS } = {}) {
   if (input?.hook_event_name !== "PostToolUse" || !toolNames.includes(input.tool_name)) return { bound: false };
   const payload = resultPayload(input.tool_response);
-  if (!payload?.reviewId || !input.tool_input?.id) return { bound: false };
+  if (!payload?.reviewId || (!isDesignVersion(payload.reviewId) && !input.tool_input?.id)) return { bound: false };
   await privateDirectory(stateDir);
-  const key = reviewKey({ boxId: input.tool_input.id, reviewId: payload.reviewId });
+  const key = reviewKey({ boxId: input.tool_input?.id, reviewId: payload.reviewId });
   const ticket = await readPrivateJson(join(stateDir, `${key}.ticket.json`)).catch((err) => { if (err.code === "ENOENT") return null; throw err; });
   if (!ticket) return { bound: false, reason: "no_adapter_ticket" };
   if (input.tool_response?._meta?.psbxCodexFeedback?.token !== ticket.token) return { bound: false, reason: "missing_or_mismatched_private_marker" };
@@ -228,7 +230,7 @@ export function createCodexFeedback({ apiUrl, headers, authorizedFetch, callRemo
     if (journal && Object.keys(identity).some((key) => journal[key] !== identity[key])) throw new Error("Feedback delivery journal does not match the original thread and event");
     if (journal && journal.state !== "host_accepted") { emit({ reason: "host_delivery_uncertain", reportId: event.reportId }); await sleep(2000, signal); return; }
     if (!journal) {
-      const result = await callRemoteReport({ id: event.boxId, reportId: event.reportId, signal });
+      const result = await callRemoteReport({ ...reportArgs(event), signal });
       reportToolOutput(result); // Fail before opening a turn if media preparation/format is incomplete.
       const currentHost = await getHost(signal);
       await currentHost.probeThread(binding.sessionId);
@@ -269,7 +271,7 @@ export function createCodexFeedback({ apiUrl, headers, authorizedFetch, callRemo
       const currentHost = await getHost(signal);
       await currentHost.probeThread(binding.sessionId);
       const consumerId = `codex_${hash(JSON.stringify([socketPath, binding.sessionId])).slice(0,40)}`;
-      await post("", { consumerId, boxId: binding.boxId, reviewId: binding.reviewId, host: "codex", capability: CODEX_FEEDBACK_CAPABILITY }, signal);
+      await post("", { consumerId, ...(binding.boxId ? { boxId: binding.boxId } : {}), reviewId: binding.reviewId, host: "codex", capability: CODEX_FEEDBACK_CAPABILITY }, signal);
       let consumer = consumers.get(consumerId);
       if (!consumer) { consumer = { id: consumerId, bindings: new Map() }; consumers.set(consumerId, consumer); }
       consumer.bindings.set(key, binding); ticket.bound = true;
@@ -280,11 +282,13 @@ export function createCodexFeedback({ apiUrl, headers, authorizedFetch, callRemo
   return {
     async trackReview({ boxId, reviewId }) {
       if (!configured) return { supported: false, reason: state.reason };
-      nonempty(boxId, "boxId"); nonempty(reviewId, "reviewId");
+      nonempty(reviewId, "reviewId");
+      boxId = reviewBox(boxId, reviewId);
+      if (!isDesignVersion(reviewId)) nonempty(boxId, "boxId");
       if (!headers?.["X-Psbx-Agent"]) throw new Error("Codex feedback tracking requires the actual adapter agent identity");
       await privateDirectory(stateDir);
       const key = reviewKey({ boxId, reviewId });
-      if (!tickets.has(key)) { const ticket = { boxId, reviewId, token: randomBytes(24).toString("hex"), agentId: headers["X-Psbx-Agent"] }; await writePrivateJson(join(stateDir, `${key}.ticket.json`), ticket); tickets.set(key, ticket); }
+      if (!tickets.has(key)) { const ticket = { ...(boxId ? { boxId } : {}), reviewId, token: randomBytes(24).toString("hex"), agentId: headers["X-Psbx-Agent"] }; await writePrivateJson(join(stateDir, `${key}.ticket.json`), ticket); tickets.set(key, ticket); }
       return { supported: state.supported, configured: true, awaitingHook: true, stateDir, hookMeta: { token: tickets.get(key).token } };
     },
     bindHook(input) { return writeCodexHookBinding(input, { stateDir, toolNames }); },

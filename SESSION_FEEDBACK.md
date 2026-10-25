@@ -28,7 +28,8 @@ private, including the local control socket, native history, report contents and
 copy it into a repository or share its configuration. Native CLI versions must support headless JSON output and exact
 session resume.
 
-The original AI calls `sandbox_review`. Its MCP adapter registers that exact review with the supervisor. The App can
+The original AI calls `sandbox_review`, or draws a design version with `sandbox_draft`, `sandbox_architecture` or
+`sandbox_schema` (a design needs no box). Its MCP adapter registers that exact review with the supervisor. The App can
 submit after the AI's turn exits: the supervisor remains running, claims the durable report, and starts the next native
 turn. If a turn is still running, the report waits until that native writer exits. Reports from a different review or
 session are never redirected to the latest open conversation.

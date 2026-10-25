@@ -171,8 +171,9 @@ registered native runner.
 
 ### Feedback back to the original conversation (Codex, Claude Code, Cursor, Gemini CLI)
 
-After `sandbox_review` succeeds, App feedback for that review returns to the same conversation that asked for it. The same holds for each version drawn with `sandbox_draft`, `sandbox_architecture` or `sandbox_schema`: what the person circles and says about it in the App comes back to the conversation that drew it.
-The adapter writes a ticket (box, review and the adapter's own agent id, no credentials) and starts one small local
+After `sandbox_review` succeeds, App feedback for that review returns to the same conversation that asked for it. The same holds for each version drawn with `sandbox_draft`, `sandbox_architecture` or `sandbox_schema`: what the person circles and says about it in the App comes back to the conversation that drew it. A design belongs to the account
+and that conversation, not to a box: the design tools need no box `id`, and its feedback is routed the same way without one.
+The adapter writes a ticket (review, its box for a `sandbox_review` card, and the adapter's own agent id, no credentials) and starts one small local
 relay per account. The relay registers a feedback consumer for that conversation, claims submitted reports and hands
 the conversation a short follow-up telling it which report to read with `sandbox_report`; that read marks the App
 receipt read. Each host only differs in how the follow-up enters the conversation:
@@ -180,7 +181,7 @@ receipt read. Each host only differs in how the follow-up enters the conversatio
 | Host | Hooks | How the conversation receives it |
 |---|---|---|
 | Codex (Desktop, CLI, IDE) | none | The thread comes from Codex's tool-call metadata; the relay runs the host's own `codex queue --thread`. Idle threads start a turn; busy threads get it after the current turn. |
-| Claude Code (CLI, desktop) | `install claude-code` | A background `asyncRewake` hook wakes the idle session; a busy session reads it after its current tool call. Reopening the session hands over anything that arrived while it was closed. `claude -p "<prompt>"` runs the hook in the foreground, so there the call that opens a review waits for the report, and `sandbox_report` returns at once. |
+| Claude Code (CLI, desktop) | `install claude-code` | A background `asyncRewake` hook wakes the idle session; a busy session reads it after its current tool call. The hook waits inside the session's own CLI process, so a session that is not running cannot take it: in the CLI, resuming it (`claude --resume <session id>`) hands over anything that arrived meanwhile. Claude Desktop stops idle sessions when memory runs low, and only opening such a session in the app does not start it again: send it a message (any message) and the app resumes it, which hands the feedback over. Until then the App's receipt says the original conversation is not running and asks the person to do that. `claude -p "<prompt>"` runs the hook in the foreground, so there the call that opens a review waits for the report, and `sandbox_report` returns at once. |
 | Cursor | `install cursor` | `afterMCPExecution` attaches the review; the `stop` hook returns it as `followup_message`. Not yet verified end to end with a real Cursor agent. |
 | Gemini CLI | `install gemini` | `AfterTool` attaches the review; the `AfterAgent` hook returns it with `decision: "block"`. |
 
@@ -212,7 +213,8 @@ To wait the full 30 minutes in Codex, set `tool_timeout_sec = 1920` for this MCP
 `waitSec` or the adapter setting alone cannot extend the host's deadline. Existing cached adapter processes keep
 their old settings until restarted. This package does not change client configuration automatically.
 
-`sandbox_report` reads an account-owned report by `id` and `reportId`, including its media URLs, timed transcripts
+`sandbox_report` reads an account-owned report by `reportId`, with the box `id` for a report on a `sandbox_review` card
+(a report on a design needs only its `reportId`), including its media URLs, timed transcripts
 and annotated frames. It can replay a report that an earlier tool already returned, without claiming the box or
 consuming other pending messages. Reports and media remain available for 7 days. A receipt records preparation of
 the complete tool result, rather than the AI understanding or completing the requested change.

@@ -1,7 +1,9 @@
 // App feedback back to the original AI conversation, for any MCP host.
 //
 // One pipeline, one small delivery driver per host:
-//   adapter  -> after sandbox_review writes a ticket (box, review, owner agent) and starts the relay
+//   adapter  -> after sandbox_review, or a design tool's new version, writes a ticket (review, its box, owner agent)
+//               and starts the relay. A design version (dsn_…) has no box: its feedback is bound, claimed and read
+//               by reviewId and reportId alone.
 //   host     -> tells which conversation owns the review:
 //                 Codex: tools/call _meta.threadId (the adapter records it in the ticket)
 //                 Claude Code, Cursor, Gemini CLI: their after-tool hook attaches its session id
@@ -9,6 +11,8 @@
 //                 codex  : `codex queue --thread` into Codex's own follow-up queue
 //                 hook   : a private mailbox the conversation's hook waits on (feedback-hook.mjs)
 //               and acknowledges host acceptance only after the host took the follow-up.
+//               A Claude Code follow-up no waiter is left to take (the conversation is closed or was stopped
+//               by Claude Desktop) is reported to the App as host_inactive, so the person can resume it.
 //               Each ticket binds on its own: one the server refuses never holds up the others.
 //   adapter  -> when that conversation reads the report with sandbox_report, acknowledges `read`.
 // Credentials stay in the adapter and relay environments; state files hold ids only.
@@ -27,7 +31,14 @@ export const CAPABILITIES = Object.freeze({ codex: "codex/thread-queue", "claude
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const sha = (...parts) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 export const defaultFeedbackDir = (env = process.env) => env.PSBX_FEEDBACK_DIR || join(homedir(), ".cache", "parallelsandbox", "feedback");
-export const ticketKey = (boxId, reviewId) => sha("ticket", boxId, reviewId).slice(0, 40);
+// A design version (sandbox_draft／sandbox_architecture／sandbox_schema, id dsn_…) belongs to the account and the
+// conversation that drew it, not to a box, even when the tool was given a box id.
+export const isDesignVersion = (reviewId) => typeof reviewId === "string" && reviewId.startsWith("dsn_");
+// The box a review's feedback goes with: none for a design version.
+export const reviewBox = (boxId, reviewId) => (isDesignVersion(reviewId) ? undefined : boxId);
+// The sandbox_report arguments that read one report of this review.
+export const reportArgs = ({ boxId, reviewId, reportId }) => (isDesignVersion(reviewId) ? { reportId } : { id: boxId, reportId });
+export const ticketKey = (boxId, reviewId) => sha("ticket", reviewBox(boxId, reviewId) ?? "", reviewId).slice(0, 40);
 export const sessionKey = (host, session) => sha("session", host, session).slice(0, 40);
 export const credentialKey = (env, apiUrl, mcpUrl) => sha("cred", apiUrl, env.PARALLELSANDBOX_API_KEY ? sha(env.PARALLELSANDBOX_API_KEY) : `oauth:${mcpUrl}`).slice(0, 16);
 const stamp = () => new Date().toISOString();
@@ -105,9 +116,13 @@ async function psParent(pid) {
 // The follow-up carries only a pointer: codex queue cannot attach images and hook output
 // is plain text. The conversation reads the complete report through its own MCP connection.
 export function followUpText(event) {
+  if (isDesignVersion(event.reviewId)) return [
+    `[ParallelSandbox] The person sent feedback in the ParallelSandbox app on design version ${event.reviewId}. Call the parallelsandbox sandbox_report tool with exactly ${JSON.stringify(reportArgs(event))} to read it, change what they asked, then call the same design tool again with the same topic for the next version.`,
+    "This message was delivered automatically by ParallelSandbox; it contains no feedback content.",
+  ].join("\n");
   return [
     `[ParallelSandbox] The person submitted feedback from the ParallelSandbox App for review ${event.reviewId} on box ${event.boxId}.`,
-    `Call the parallelsandbox sandbox_report tool with exactly ${JSON.stringify({ id: event.boxId, reportId: event.reportId })} to read the complete report (text, annotated images, recordings and timed transcripts), then handle it in this conversation.`,
+    `Call the parallelsandbox sandbox_report tool with exactly ${JSON.stringify(reportArgs(event))} to read the complete report (text, annotated images, recordings and timed transcripts), then handle it in this conversation.`,
     "This message was delivered automatically by ParallelSandbox; it contains no feedback content.",
   ].join("\n");
 }
@@ -119,8 +134,9 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
   const credKey = credentialKey(env, api, mcpUrl);
   let cliPromise;
   return {
-    // Called after a successful sandbox_review. Codex names its thread here; hook hosts attach later.
+    // Called after a successful sandbox_review or design version. Codex names its thread here; hook hosts attach later.
     async trackReview({ boxId, reviewId, clientName, meta }) {
+      boxId = reviewBox(boxId, reviewId);
       privateDir(dir); privateDir(p.tickets);
       const file = join(p.tickets, `${ticketKey(boxId, reviewId)}.json`);
       // Only the agent that opened a review may bind its feedback (the server answers 403 to anyone else), and that
@@ -130,11 +146,11 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
       const prev = ticketOrNull(file);
       if (prev?.agentId && prev.agentId !== agentId && prev.boxId === boxId && prev.reviewId === reviewId && Date.now() < prev.expiresAt) {
         if (prev.credKey === credKey) await spawnRelay({ dir, credKey, env, log });
-        log(`feedback: review ${reviewId} on box ${boxId} was opened by another agent; its App feedback keeps returning to the conversation that opened it`);
+        log(`feedback: review ${reviewId}${boxId ? ` on box ${boxId}` : ""} was opened by another agent; its App feedback keeps returning to the conversation that opened it`);
         return { automatic: false, host: prev.codex ? "codex" : (prev.client || "unknown"), route: "original conversation", reason: "opened_by_another_agent",
           note: "This review was opened by another conversation, or by this one before its ParallelSandbox connection restarted. Its App feedback keeps returning to the conversation that opened it; if no follow-up arrives here, read a submitted report with sandbox_report." };
       }
-      const ticket = { boxId, reviewId, agentId, apiUrl: api, mcpUrl, credKey, client: clientName || "", createdAt: Date.now(), expiresAt: Date.now() + TICKET_LIFETIME_MS };
+      const ticket = { ...(boxId ? { boxId } : {}), reviewId, agentId, apiUrl: api, mcpUrl, credKey, client: clientName || "", createdAt: Date.now(), expiresAt: Date.now() + TICKET_LIFETIME_MS };
       const threadId = codexThreadId(meta, clientName);
       if (threadId) {
         cliPromise ||= findCli({ env });
@@ -147,13 +163,14 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
       if (ticket.codex) return { automatic: true, host: "codex", route: "codex queue", threadId };
       return { automatic: "when_hooks_installed", host: clientName || "unknown", route: "host hook" };
     },
-    // The original conversation read this exact report: the App receipt becomes `read`.
+    // The original conversation read this exact report: the App receipt becomes `read`. A design report is read without
+    // a box id, and with one it is the same report.
     async onReportRead({ boxId, reportId }) {
       for (const name of list(p.journal)) {
         const path = join(p.journal, name);
         const j = orNull(() => readJson(path));
         // The conversation can read the report before the relay acknowledged acceptance.
-        if (!j || j.boxId !== boxId || j.reportId !== reportId || !["mailed", "handed", "accepted"].includes(j.state)) continue;
+        if (!j || (j.boxId && j.boxId !== boxId) || j.reportId !== reportId || !["mailed", "handed", "accepted"].includes(j.state)) continue;
         const res = await authorizedFetch(`${api}/v1/feedback-consumers/${encodeURIComponent(j.consumerId)}/ack`, { method: "POST", headers: { ...headers, "X-Psbx-Agent": j.agentId, "Content-Type": "application/json" }, body: JSON.stringify({ eventId: j.eventId, reportId, leaseToken: j.leaseToken, state: "read" }) });
         if (!res.ok) throw new Error(`read acknowledgement failed (${res.status})`);
         writeJson(path, { ...j, state: "read", readAt: Date.now() });
@@ -196,6 +213,31 @@ export function attachReview({ dir = defaultFeedbackDir(), host, session, boxId,
   return true;
 }
 
+// Claude Code runs a turn's asyncRewake hook once: when one turn opens several reviews or design versions
+// (a draft, then its architecture), only the first one's hook attaches (Claude Code 2.1.310). One stdio adapter
+// serves one Claude Code conversation, so that conversation's waiter also attaches the other tickets its adapter
+// (the same agentId) wrote. Other hosts may share an adapter between conversations and keep attaching per hook.
+export function attachSiblings({ dir = defaultFeedbackDir(), host, session }) {
+  if (host !== "claude-code") return 0;
+  const p = paths(dir);
+  const agents = new Set();
+  for (const name of list(p.attach)) {
+    const a = orNull(() => readJson(join(p.attach, name)));
+    if (!a || a.host !== host || a.session !== session) continue;
+    const t = orNull(() => readJson(join(p.tickets, name)));
+    if (t?.agentId) agents.add(t.agentId);
+  }
+  let attached = 0;
+  for (const name of list(p.tickets)) {
+    if (agents.size === 0 || existsSync(join(p.attach, name))) continue;
+    const t = orNull(() => readJson(join(p.tickets, name)));
+    if (!t || t.codex || !agents.has(t.agentId) || Date.now() > t.expiresAt) continue;
+    writeJson(join(p.attach, name), { host, session, at: Date.now() });
+    attached++;
+  }
+  return attached;
+}
+
 // Pending follow-ups for one conversation, oldest first.
 export function mailFor({ dir = defaultFeedbackDir(), host, session }) {
   const box = join(paths(dir).mail, sessionKey(host, session));
@@ -216,6 +258,23 @@ export function sessionExpectsFeedback({ dir = defaultFeedbackDir(), host, sessi
   });
 }
 
+// The Claude Code hook keeps one background waiter per conversation (feedback-hook.mjs), and it dies with
+// that conversation's CLI: Claude Desktop stops idle sessions under memory pressure, and opening such a
+// session does not start it again, only sending it a message does. A killed waiter can leave its pid file
+// behind, so the pid must still be this package's hook for that host.
+export const waiterPidFile = (dir, host, session) => join(paths(dir).run, `waiter-${sessionKey(host, session)}.pid`);
+async function commandLine(pid) {
+  if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
+  const { stdout } = await run("ps", ["-ww", "-o", "command=", "-p", String(pid)]);
+  return stdout;
+}
+export async function waiterRunning({ dir = defaultFeedbackDir(), host, session, commandOf = commandLine }) {
+  const pid = Number(orNull(() => readFileSync(waiterPidFile(dir, host, session), "utf8")) || 0);
+  if (!alive(pid)) return false;
+  if (process.platform === "win32") return true;
+  return (await commandOf(pid).catch(() => "")).includes(`hook --host ${host}`);
+}
+
 // ---------- relay ----------
 const sleep = (ms, signal) => new Promise((r) => { const t = setTimeout(r, ms); signal?.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true }); });
 
@@ -223,8 +282,11 @@ const sleep = (ms, signal) => new Promise((r) => { const t = setTimeout(r, ms); 
 // (network, timeout, 401/408/425/429, 5xx) is retried after 30 s, doubling up to 10 minutes.
 export const BIND_RETRY_MS = 30_000, BIND_RETRY_MAX_MS = 600_000;
 const retryableStatus = (status) => !status || status >= 500 || [401, 408, 425, 429].includes(status);
+// A conversation just woken by one follow-up starts its next waiter at its next sandbox_report call, so a
+// waiter missing for a moment is normal; one still missing after this long means the conversation stopped.
+export const HOST_GRACE_MS = 30_000;
 
-export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, signal, print = console.log }) {
+export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, hostGraceMs = HOST_GRACE_MS, waiting = waiterRunning, signal, print = console.log }) {
   const p = paths(dir);
   privateDir(p.run); privateDir(p.journal); privateDir(p.mail);
   const pidFile = join(p.run, `relay-${credKey}.pid`);
@@ -262,7 +324,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
       if (j && (j.reportId !== event.reportId || j.boxId !== event.boxId)) throw new Error("delivery journal does not match its event");
       if (j?.state === "sending") { say("uncertain earlier codex queue attempt for", event.reportId, "- not repeating"); return; }
       if (!j) {
-        j = { consumerId: consumer.id, agentId: consumer.agentId, host: consumer.target.host, target: consumer.target.id, eventId: event.eventId, boxId: event.boxId, reviewId: event.reviewId, reportId: event.reportId, leaseToken: event.leaseToken, state: "sending" };
+        j = { consumerId: consumer.id, agentId: consumer.agentId, host: consumer.target.host, target: consumer.target.id, eventId: event.eventId, ...(event.boxId ? { boxId: event.boxId } : {}), reviewId: event.reviewId, reportId: event.reportId, leaseToken: event.leaseToken, state: "sending" };
         writeJson(jpath, j);
         if (consumer.target.kind === "codex") {
           try { j.queuedId = await queue({ ...consumer.target.codex, threadId: consumer.target.id }, followUpText(event)); }
@@ -271,8 +333,9 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
           say("queued report", event.reportId, "as", j.queuedId, "for codex thread", consumer.target.id);
         } else {
           const box = privateDir(join(p.mail, sessionKey(consumer.target.host, consumer.target.id)));
-          writeJson(join(box, `${event.eventId}.json`), { eventId: event.eventId, boxId: event.boxId, reviewId: event.reviewId, reportId: event.reportId, text: followUpText(event), at: Date.now() });
+          writeJson(join(box, `${event.eventId}.json`), { eventId: event.eventId, ...(event.boxId ? { boxId: event.boxId } : {}), reviewId: event.reviewId, reportId: event.reportId, text: followUpText(event), at: Date.now() });
           j.state = "mailed";
+          j.mailedAt = Date.now();
           say("mailed report", event.reportId, "to", consumer.target.host, "session", consumer.target.id);
         }
       }
@@ -299,6 +362,31 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         } catch (err) { if (err.status !== 409) throw err; } // Lease expired: the next claim renews it.
       }
     };
+    // Claude Code takes a mailed follow-up only through a live waiter. While none runs, the conversation is not
+    // running (closed, or stopped by Claude Desktop while idle) and the App asks the person to send it a message;
+    // the follow-up stays mailed for the waiter that starts when the conversation runs again.
+    let hostReports = true;
+    const reportHost = async (consumer) => {
+      if (!hostReports || consumer.target.host !== "claude-code") return;
+      for (const name of list(p.journal)) {
+        const jpath = join(p.journal, name);
+        const j = orNull(() => readJson(jpath));
+        if (!j || j.consumerId !== consumer.id || j.state !== "mailed" || Date.now() - (j.mailedAt || 0) < hostGraceMs) continue;
+        if (existsSync(join(p.mail, sessionKey(j.host, j.target), `${j.eventId}.handed`))) continue;
+        const inactive = !(await waiting({ dir, host: j.host, session: j.target }));
+        if (inactive === !!j.hostInactive) continue;
+        try {
+          await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/ack`, { eventId: j.eventId, reportId: j.reportId, leaseToken: j.leaseToken, state: inactive ? "host_inactive" : "host_active" });
+        } catch (err) {
+          if (err.status === 400) { hostReports = false; say("this server does not take conversation status:", err.message); return; }
+          if (err.status === 404 || err.status === 409) continue; // Lease expired or taken: the next claim renews it.
+          throw err;
+        }
+        const now = orNull(() => readJson(jpath));
+        if (now?.state === "mailed") writeJson(jpath, { ...now, hostInactive: inactive });
+        say("reported", j.reportId, inactive ? "conversation is not running" : "conversation is running again", j.host, j.target);
+      }
+    };
     const consume = async (consumer) => {
       let backoff = 1000;
       while (!controller.signal.aborted) {
@@ -307,6 +395,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
           const { events = [] } = await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/claim`, { waitSec: once ? 0 : (consumer.target.kind === "hook" ? Math.min(claimWaitSec, 3) : claimWaitSec) });
           for (const event of events) { lastWork = Date.now(); await deliver(consumer, event); }
           await ackHanded(consumer);
+          await reportHost(consumer);
           backoff = 1000;
           if (once) return;
         } catch (err) {
@@ -360,10 +449,10 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
           const prev = setAside.get(key);
           if (prev && prev.sig === sig && Date.now() < prev.retryAt) continue;
           try {
-            await request(ticket, ticket.agentId, "", { consumerId, boxId: ticket.boxId, reviewId: ticket.reviewId, host: target.host, capability: CAPABILITIES[target.host] });
+            await request(ticket, ticket.agentId, "", { consumerId, ...(ticket.boxId ? { boxId: ticket.boxId } : {}), reviewId: ticket.reviewId, host: target.host, capability: CAPABILITIES[target.host] });
           } catch (err) {
             if (controller.signal.aborted) break;
-            setTicketAside(key, sig, err, `cannot bind review ${ticket.reviewId} on box ${ticket.boxId} (ticket ${key}, agent ${ticket.agentId}, ${target.host} ${target.id}):`);
+            setTicketAside(key, sig, err, `cannot bind review ${ticket.reviewId}${ticket.boxId ? ` on box ${ticket.boxId}` : ""} (ticket ${key}, agent ${ticket.agentId}, ${target.host} ${target.id}):`);
             firstError ||= err;
             continue;
           }

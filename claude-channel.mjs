@@ -1,18 +1,20 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { isDesignVersion, reviewBox } from "./feedback-relay.mjs";
 
 export const CLAUDE_CHANNEL_CAPABILITIES = {
   experimental: { "claude/channel": {} },
 };
 
 // These instructions apply only to this opted-in channel, not to ordinary turns.
-export const CLAUDE_CHANNEL_INSTRUCTIONS = "This development integration tests Claude Code native channel capability. For a channel activation event, call parallelsandbox_channel_ready with that event's nonce. The challenge proves native event reception only; it does not prove original-session routing. The current adapter does not automatically deliver human feedback without a trusted host integration that proves immutable review/session binding and session-scoped native queue delivery. A future guarded human feedback event contains only the box id and reportId: read them with sandbox_report, then call parallelsandbox_feedback_ack after reading the complete result. Receipt does not mean the requested work is finished. Permission prompts and questions stay in Claude Code.";
+export const CLAUDE_CHANNEL_INSTRUCTIONS = "This development integration tests Claude Code native channel capability. For a channel activation event, call parallelsandbox_channel_ready with that event's nonce. The challenge proves native event reception only; it does not prove original-session routing. The current adapter does not automatically deliver human feedback without a trusted host integration that proves immutable review/session binding and session-scoped native queue delivery. A future guarded human feedback event contains only the reportId and, for a review card, its box id (a design version has none): read it with sandbox_report, then call parallelsandbox_feedback_ack with the same ids after reading the complete result. Receipt does not mean the requested work is finished. Permission prompts and questions stay in Claude Code.";
 
 const READY = "parallelsandbox_channel_ready";
 const ACK = "parallelsandbox_feedback_ack";
 const idPattern = /^[A-Za-z0-9_-]{1,128}$/;
 const validId = (value) => typeof value === "string" && idPattern.test(value);
 const result = (value, isError = false) => ({ content: [{ type: "text", text: JSON.stringify(value) }], ...(isError ? { isError: true } : {}) });
-const key = (boxId, reportId) => JSON.stringify([boxId, reportId]);
+// A design version (dsn_…) and its reports have no box.
+const key = (boxId, reportId) => JSON.stringify([boxId ?? "", reportId]);
 
 function payloadOf(value) {
   if (!value || typeof value !== "object" || value.isError) return null;
@@ -48,6 +50,8 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
   const read = new Set();
   const acknowledged = new Set();
   const foreground = new Set();
+  // A design report is pending without a box, whether or not the AI also passed one when reading it.
+  const reportKeyOf = (boxId, reportId) => (pending.has(key(undefined, reportId)) || acknowledged.has(key(undefined, reportId)) ? key(undefined, reportId) : key(boxId, reportId));
   let activated = false;
   let handshakeSent = false;
   let closed = false;
@@ -63,7 +67,7 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
       error.guardRejected = true;
       throw error;
     }
-    return Object.freeze({ boxId: value.boxId, reviewId: value.reviewId, sessionId: value.sessionId, bindingId: value.bindingId, queueScope: Object.freeze({ kind: "native-session", sessionId: value.sessionId, proofId: value.queueScope.proofId }) });
+    return Object.freeze({ ...(review.boxId ? { boxId: value.boxId } : {}), reviewId: value.reviewId, sessionId: value.sessionId, bindingId: value.bindingId, queueScope: Object.freeze({ kind: "native-session", sessionId: value.sessionId, proofId: value.queueScope.proofId }) });
   }
 
   async function checkSession(review, method, reportId) {
@@ -78,7 +82,7 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
 
   const readyToolDefs = [
     { name: READY, description: "Confirm native channel event reception using its nonce. This only proves channel capability; current original-session routing is unsupported without a separately verified native session/queue guard.", inputSchema: { type: "object", required: ["nonce"], additionalProperties: false, properties: { nonce: { type: "string" } } }, annotations: { idempotentHint: true } },
-    { name: ACK, description: "Acknowledge reading a human feedback report delivered to this original session. First read its complete sandbox_report result. This receipt does not mark the requested work finished.", inputSchema: { type: "object", required: ["id", "reportId"], additionalProperties: false, properties: { id: { type: "string" }, reportId: { type: "string" } } }, annotations: { idempotentHint: true } },
+    { name: ACK, description: "Acknowledge reading a human feedback report delivered to this original session. First read its complete sandbox_report result. This receipt does not mark the requested work finished.", inputSchema: { type: "object", required: ["reportId"], additionalProperties: false, properties: { id: { type: "string", description: "The box id of a review card's report; omit it for a design report." }, reportId: { type: "string" } } }, annotations: { idempotentHint: true } },
   ];
 
   async function post(path, body, timeoutMs = 10_000) {
@@ -122,7 +126,7 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
       try {
         if (!hasSessionGuard) throw new Error("Original native session guard is unavailable.");
         const proof = sessionProof(await trustedSessionGuard.bindReview({ boxId: review.boxId, reviewId: review.reviewId }), review);
-        const receipt = await post("/v1/feedback-consumers", { consumerId, boxId: review.boxId, reviewId: review.reviewId, host: "claude-code", capability: "claude/channel" });
+        const receipt = await post("/v1/feedback-consumers", { consumerId, ...(review.boxId ? { boxId: review.boxId } : {}), reviewId: review.reviewId, host: "claude-code", capability: "claude/channel" });
         if (receipt?.ok !== true || (receipt.consumerId !== undefined && receipt.consumerId !== consumerId)) throw new Error("Invalid feedback binding receipt.");
         review.proof = proof;
         review.bound = true;
@@ -138,7 +142,7 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
     if (closed || !activated) return;
     if (!data || !Array.isArray(data.events)) throw new Error("Invalid feedback claim response.");
     for (const event of data.events) {
-      if (!event || !validId(event.eventId) || !validId(event.reportId) || !validId(event.boxId) || !validId(event.reviewId) || typeof event.leaseToken !== "string" || !event.leaseToken || typeof event.leaseExpiresAt !== "string" || !Number.isFinite(Date.parse(event.leaseExpiresAt))) throw new Error("Invalid feedback event.");
+      if (!event || !validId(event.eventId) || !validId(event.reportId) || !validId(event.reviewId) || !(isDesignVersion(event.reviewId) ? validId(event.designId) : validId(event.boxId)) || typeof event.leaseToken !== "string" || !event.leaseToken || typeof event.leaseExpiresAt !== "string" || !Number.isFinite(Date.parse(event.leaseExpiresAt))) throw new Error("Invalid feedback event.");
       const review = reviews.get(key(event.boxId, event.reviewId));
       if (!review?.bound) throw new Error("Feedback event does not belong to this consumer's bound review.");
       const reportKey = key(event.boxId, event.reportId);
@@ -149,7 +153,7 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
       pending.set(reportKey, { ...event, acking: previous?.acking });
       if (sent.has(reportKey)) continue;
       await checkSession(review, "checkDispatch", event.reportId);
-      await server.notification({ method: "notifications/claude/channel", params: { content: "Human feedback is available for the existing task. Read the report with sandbox_report and acknowledge receipt after reading it.", meta: { box_id: event.boxId, report_id: event.reportId } } });
+      await server.notification({ method: "notifications/claude/channel", params: { content: "Human feedback is available for the existing task. Read the report with sandbox_report and acknowledge receipt after reading it.", meta: { ...(isDesignVersion(event.reviewId) ? { design_id: event.designId } : { box_id: event.boxId }), report_id: event.reportId } } });
       if (!closed) sent.add(reportKey);
       // A successful notification is only a transport write, never an ACK.
     }
@@ -196,12 +200,14 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
 
   async function onReviewResult(boxId, toolResult) {
     const data = payloadOf(toolResult);
-    if (closed || !validId(boxId) || data?.ok !== true || !validId(data.reviewId)) return { bound: false };
+    if (closed || data?.ok !== true || !validId(data.reviewId)) return { bound: false };
+    boxId = reviewBox(boxId, data.reviewId);
+    if (!isDesignVersion(data.reviewId) && !validId(boxId)) return { bound: false };
     if (!hasSessionGuard) return { bound: false, reason: "original_session_guard_unavailable" };
     if (validId(data.reportId) && typeof data.fromHuman === "string" && data.fromHuman.trim() && !data.humanDeliveryError) foreground.add(key(boxId, data.reportId));
     const reviewKey = key(boxId, data.reviewId);
     let review = reviews.get(reviewKey);
-    if (!review) { review = { boxId, reviewId: data.reviewId, bound: false, blocked: false, binding: null }; reviews.set(reviewKey, review); }
+    if (!review) { review = { ...(boxId ? { boxId } : {}), reviewId: data.reviewId, bound: false, blocked: false, binding: null }; reviews.set(reviewKey, review); }
     if (!activated) return { bound: false, reason: "channel_not_activated" };
     review.blocked = false;
     try { await bind(review); ensurePolling(); return { bound: review.bound }; }
@@ -209,9 +215,9 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
   }
 
   function onToolResult(name, args, toolResult) {
-    if (closed || name !== "sandbox_report" || !validId(args?.id) || !validId(args?.reportId)) return;
+    if (closed || name !== "sandbox_report" || (args?.id !== undefined && !validId(args.id)) || !validId(args?.reportId)) return;
     const data = payloadOf(toolResult);
-    if (data?.ok === true && data.reportId === args.reportId && typeof data.fromHuman === "string" && data.fromHuman.trim() && !data.humanDeliveryError) read.add(key(args.id, args.reportId));
+    if (data?.ok === true && data.reportId === args.reportId && typeof data.fromHuman === "string" && data.fromHuman.trim() && !data.humanDeliveryError) read.add(reportKeyOf(args.id, args.reportId));
   }
 
   async function handleTool(name, args) {
@@ -225,8 +231,8 @@ export function createClaudeChannel({ server, authorizedFetch, apiUrl, headers, 
       ensurePolling();
       return result({ ok: true, activated: true, capability: "claude/channel", sessionRouting: false, note: "Native event reception is verified. It does not establish original-session routing; the current adapter has no verified native session/queue integration." });
     }
-    if (!activated || !onlyFields(args, ["id", "reportId"]) || !validId(args?.id) || !validId(args?.reportId)) return result({ ok: false, error: "Use the exact box id and reportId from this original session's feedback event." }, true);
-    const reportKey = key(args.id, args.reportId);
+    if (!activated || !onlyFields(args, ["id", "reportId"]) || (args?.id !== undefined && !validId(args.id)) || !validId(args?.reportId)) return result({ ok: false, error: "Use the exact reportId, and for a review card its box id, from this original session's feedback event." }, true);
+    const reportKey = reportKeyOf(args.id, args.reportId);
     if (acknowledged.has(reportKey)) return result({ ok: true, state: "read", alreadyAcknowledged: true, reportId: args.reportId });
     let event = pending.get(reportKey);
     if (!event || !read.has(reportKey)) return result({ ok: false, error: "Read this consumer's complete sandbox_report result before acknowledging receipt." }, true);

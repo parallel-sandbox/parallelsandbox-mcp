@@ -60,13 +60,15 @@ Official hook documentation describes `tool_response` as the MCP call result. Th
 ```js
 const feedback = createCodexFeedback({
   apiUrl, headers, authorizedFetch,
-  callRemoteReport: ({ id, reportId, signal }) => callCompleteReport(id, reportId, signal),
+  // { reportId } for a design version, { id: boxId, reportId } for a sandbox_review card.
+  callRemoteReport: ({ signal, ...reportArgs }) => callCompleteReport(reportArgs, signal),
   cliPath, socketPath, stateDir,
   onState,
 });
 feedback.start();
 
-// After a successful sandbox_review, before returning its result to the host:
+// After a successful sandbox_review or design version, before returning its result to the host.
+// A design version (reviewId dsn_…) has no box: boxId is omitted.
 const tracked = await feedback.trackReview({ boxId, reviewId });
 if (tracked.hookMeta) {
   result._meta = { ...result._meta, psbxCodexFeedback: tracked.hookMeta };
@@ -75,7 +77,7 @@ if (tracked.hookMeta) {
 
 `headers` contains the actual adapter's `X-Psbx-Agent`; `callRemoteReport` returns the complete `sandbox_report` MCP result, including inline frames and the text JSON containing files, recording URLs and transcripts. `stop()` ends the bridge's local background tasks. `status()` distinguishes configuration, verified pairing, and a confirmed host acceptance. The hook and adapter keep API credentials out of binding tickets.
 
-After a trusted binding, the adapter registers a feedback consumer scoped to the review. A single original-thread consumer can register multiple boxes and rounds. Its background claim loop runs independently of model generation, so the model can finish its turn normally. The adapter process and paired host must remain available for automatic delivery.
+After a trusted binding, the adapter registers a feedback consumer scoped to the review. A single original-thread consumer can register multiple boxes, rounds and design versions; a design version is registered without a box. Its background claim loop runs independently of model generation, so the model can finish its turn normally. The adapter process and paired host must remain available for automatic delivery.
 
 The bridge maps MCP text and image content to the official standalone `toolOutput` schema and sends:
 
@@ -96,7 +98,7 @@ The bridge maps MCP text and image content to the official standalone `toolOutpu
 
 Official App Server behavior starts generation when idle and queues standalone tool output when a regular turn is active. The existing thread's model, working directory and permission settings are retained.
 
-A confirmed host response is recorded before the consumer's `host_accepted` ACK. An ACK retry reuses that record without submitting another turn. A disconnect after sending leaves the result uncertain and pending for reconciliation. Journals are scoped by consumer, box, review, report and opaque event identity. Host acceptance means the tool output was accepted or queued; it does not mean the model has processed it.
+A confirmed host response is recorded before the consumer's `host_accepted` ACK. An ACK retry reuses that record without submitting another turn. A disconnect after sending leaves the result uncertain and pending for reconciliation. Journals are scoped by consumer, box (none for a design version), review, report and opaque event identity. Host acceptance means the tool output was accepted or queued; it does not mean the model has processed it.
 
 Approval or elicitation requests are surfaced through `onState` as `host_request_required`. An integration can supply `onHostRequest` to route them through its actual existing UI. Routing by the original UI has not been verified in this release; workflows requiring such requests remain limited until that host integration is demonstrated.
 

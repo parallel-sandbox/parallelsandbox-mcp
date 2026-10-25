@@ -11,7 +11,7 @@ import { execFile } from "node:child_process";
 import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
-import { alive, attachReview, parentOf, defaultFeedbackDir, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, sessionKey, takeMail, ticketKey } from "./feedback-relay.mjs";
+import { alive, attachReview, attachSiblings, parentOf, defaultFeedbackDir, isDesignVersion, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, takeMail, ticketKey, waiterPidFile } from "./feedback-relay.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const REVIEW_TOOL = /sandbox_(review|draft|architecture|schema)$/;
@@ -52,11 +52,12 @@ export function hookInput(host, raw) {
   return { session: raw.session_id, tool: raw.tool_name, input: parseMaybe(raw.tool_input), result: raw.tool_response ?? raw.tool_result, source: raw.source };
 }
 
+// A design version needs no box id; a review card is keyed by the box it was opened on.
 export function attachFromTool({ dir, host, input }) {
   if (!REVIEW_TOOL.test(input.tool || "")) return false;
-  const boxId = input.input?.id;
   const reviewId = reviewFromResult(input.result);
-  if (typeof boxId !== "string" || !reviewId) return false;
+  const boxId = isDesignVersion(reviewId) ? undefined : input.input?.id;
+  if (!reviewId || (!isDesignVersion(reviewId) && typeof boxId !== "string")) return false;
   return attachReview({ dir, host, session: input.session, boxId, reviewId });
 }
 
@@ -86,6 +87,7 @@ export const hostGone = (ancestors) => ancestors.length > 0 && (process.ppid !==
 async function waitForMail({ dir, host, session, until, by, ancestors = [] }) {
   for (;;) {
     if (hostGone(ancestors)) return null;
+    attachSiblings({ dir, host, session });
     for (const entry of mailFor({ dir, host, session })) {
       if (takeMail(entry, by)) { markDelivered(dir, entry.mail); return entry.mail; }
     }
@@ -145,6 +147,7 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
   const event = raw.hook_event_name || "";
   const holdMs = Number(env.PSBX_HOOK_HOLD_SEC || 1200) * 1000;
   if (input.tool) attachFromTool({ dir, host, input });
+  attachSiblings({ dir, host, session: input.session });
 
   if (host === "claude-code") {
     // One background waiter per conversation; the next one starts at the next review/report call.
@@ -154,8 +157,8 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
     // until the next one came: hand over a follow-up already waiting and return.
     const opened = REVIEW_TOOL.test(input.tool || "") && reviewAwaitsPerson(input.result);
     const waitMs = opened || !(await foreground({ env })) ? 7 * 24 * 3600_000 : 0;
-    const run = privateDir(paths(dir).run);
-    const lock = join(run, `waiter-${sessionKey(host, input.session)}.pid`);
+    privateDir(paths(dir).run);
+    const lock = waiterPidFile(dir, host, input.session);
     const holder = Number(orNull(() => readFileSync(lock, "utf8")) || 0);
     if (holder && holder !== process.pid && alive(holder)) return 0;
     writeFileSync(lock, String(process.pid), { mode: 0o600 });

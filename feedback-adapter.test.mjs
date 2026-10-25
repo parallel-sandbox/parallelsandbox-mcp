@@ -13,7 +13,7 @@ import { after as afterAllFeedback } from "node:test";
 const feedbackDir = mkdtempFeedback(join(tmpdir(), "psbx-adapter-feedback-"));
 afterAllFeedback(() => rmFeedback(feedbackDir, { recursive: true, force: true }));
 
-async function adapterFixture(host, env = {}) {
+async function adapterFixture(host, env = {}, toolData = {ok: true, reviewId: "unit-review", outcome: "timed_out"}) {
   const requests = [];
   const api = createServer(async (req, res) => {
     let raw = "";
@@ -32,7 +32,7 @@ async function adapterFixture(host, env = {}) {
       ? {protocolVersion: body.params.protocolVersion, capabilities: {tools: {}}, serverInfo: {name: "unit-control", version: "1"}}
       : body.method === "tools/list"
       ? {tools: [{name: "sandbox_review", description: "Unit fixture", inputSchema: {type: "object", properties: {}}}]}
-      : {content: [{type: "text", text: JSON.stringify({ok: true, reviewId: "unit-review", outcome: "timed_out"})}]};
+      : {content: [{type: "text", text: JSON.stringify(toolData)}]};
     res.writeHead(200, {"Content-Type": "application/json"});
     res.end(JSON.stringify({jsonrpc: "2.0", id: body.id, result}));
   });
@@ -120,4 +120,41 @@ test("Codex review carries an adapter binding token only in private MCP metadata
     assert.equal(ticket.token, token);
     assert.equal(f.requests.some(r => r.url.startsWith("/v1/feedback-consumers")), false);
   } finally { await f.close(); await rm(stateDir, {recursive: true, force: true}); }
+});
+
+// 設計的一版不屬於箱子：工具沒給箱子 id 也要寫票，交件才需要箱子。
+const design = {ok: true, designId: "dsg_unit", reviewId: "dsn_unit", kind: "draft", topic: "fixture", version: 1, appUrl: "https://app.unit/design/dsg_unit"};
+
+test("a design version drawn without a box id gets its feedback ticket", async () => {
+  const f = await adapterFixture("", {}, design);
+  try {
+    const result = await f.call("tools/call", {name: "sandbox_draft", arguments: {topic: "fixture", boards: []}});
+    assert.equal(JSON.parse(result.content[0].text).reviewId, "dsn_unit");
+    assert.ok(result.content.length > 1, "the feedback route note follows the design result");
+    const dir = join(feedbackDir, "tickets");
+    const tickets = await Promise.all((await readdir(dir)).filter(n => n.endsWith(".json")).map(async n => JSON.parse(await readFile(join(dir, n), "utf8"))));
+    const ticket = tickets.find(t => t.reviewId === "dsn_unit");
+    assert.ok(ticket);
+    assert.equal(Object.hasOwn(ticket, "boxId"), false);
+  } finally { await f.close(); }
+});
+
+test("a Codex design version without a box id carries its binding token; a review card without one does not", async () => {
+  const parent = join(tmpdir(), "cubelv-e2e");
+  await mkdir(parent, {recursive: true});
+  const stateDir = await mkdtemp(join(parent, "feedback-adapter-design-"));
+  const env = {PSBX_CODEX_CLI: "/unit/codex", PSBX_CODEX_HOST_SOCKET: "/unit/socket", PSBX_CODEX_FEEDBACK_DIR: stateDir};
+  const f = await adapterFixture("codex", env, design);
+  try {
+    const result = await f.call("tools/call", {name: "sandbox_architecture", arguments: {topic: "fixture", nodes: [], edges: []}});
+    const token = result._meta?.psbxCodexFeedback?.token;
+    assert.match(token, /^[a-f0-9]{48}$/);
+    const ticket = JSON.parse(await readFile(join(stateDir, (await readdir(stateDir)).find(name => name.endsWith(".ticket.json"))), "utf8"));
+    assert.deepEqual([ticket.reviewId, ticket.token, Object.hasOwn(ticket, "boxId")], ["dsn_unit", token, false]);
+  } finally { await f.close(); }
+  const card = await adapterFixture("codex", env);
+  try {
+    const result = await card.call("tools/call", {name: "sandbox_review", arguments: {what: "fixture"}});
+    assert.equal(result._meta?.psbxCodexFeedback, undefined);
+  } finally { await card.close(); await rm(stateDir, {recursive: true, force: true}); }
 });

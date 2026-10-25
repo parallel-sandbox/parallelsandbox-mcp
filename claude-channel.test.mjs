@@ -161,6 +161,40 @@ test("ACK requires the complete successful report and opaque lease stays private
   assert.equal(f.requests.filter((request) => request.url.endsWith("/ack")).length, 1);
 });
 
+// 設計的一版不屬於箱子：綁定不帶 boxId，事件帶 designId，讀與 ACK 只要 reportId（多給箱子 id 也是同一份）。
+test("a design version binds, notifies and acknowledges without a box id", async (t) => {
+  const f = fixture(t);
+  await f.activate();
+  const drawn = toolResult({ ok: true, designId: "dsg_one", reviewId: "dsn_one", kind: "draft", topic: "checkout", version: 1 });
+  assert.equal((await f.channel.onReviewResult(undefined, drawn)).bound, true);
+  const binding = f.requests.find((request) => request.url.endsWith("/feedback-consumers"));
+  assert.deepEqual(binding.body, { consumerId: "original-consumer", reviewId: "dsn_one", host: "claude-code", capability: "claude/channel" });
+  const designEvent = (n) => ({ eventId: `design-event-${n}`, reportId: `report-design-${n}`, designId: "dsg_one", reviewId: "dsn_one", leaseToken: `design-lease-${n}`, leaseExpiresAt: new Date(Date.now() + 120_000).toISOString() });
+  f.push(designEvent(1));
+  await until(() => f.feedbackNotices().length === 1);
+  assert.deepEqual(f.feedbackNotices()[0].params.meta, { design_id: "dsg_one", report_id: "report-design-1" });
+  assert.equal((await f.channel.handleTool(ackName, { reportId: "report-design-1" })).isError, true);
+  f.channel.onToolResult("sandbox_report", { reportId: "report-design-1" }, report("report-design-1"));
+  assert.equal(parsed(await f.channel.handleTool(ackName, { reportId: "report-design-1" })).state, "read");
+  assert.deepEqual(f.requests.find((request) => request.url.endsWith("/ack")).body, { eventId: "design-event-1", reportId: "report-design-1", leaseToken: "design-lease-1", state: "read" });
+  f.push(designEvent(2));
+  await until(() => f.feedbackNotices().length === 2);
+  f.channel.onToolResult("sandbox_report", { id: "box-anything", reportId: "report-design-2" }, report("report-design-2"));
+  assert.equal(parsed(await f.channel.handleTool(ackName, { id: "box-anything", reportId: "report-design-2" })).state, "read");
+  // A review card's event still needs its box, and a design event its design.
+  assert.equal((await f.channel.onReviewResult(undefined, toolResult({ ok: true, reviewId: "review-two" }))).bound, false);
+});
+
+test("a design event without its design id is rejected", async (t) => {
+  const f = fixture(t);
+  await f.activate();
+  await f.channel.onReviewResult(undefined, toolResult({ ok: true, designId: "dsg_one", reviewId: "dsn_one" }));
+  f.push({ eventId: "design-event", reportId: "report-design", reviewId: "dsn_one", boxId: "box-one", leaseToken: "lease", leaseExpiresAt: new Date(Date.now() + 120_000).toISOString() });
+  await until(() => f.requests.filter((request) => request.url.endsWith("/claim")).length >= 1);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(f.feedbackNotices().length, 0);
+});
+
 test("duplicate leases renew privately without enqueueing the same report twice", async (t) => {
   const f = fixture(t);
   await f.activate(); await f.bind(); f.push(event());
