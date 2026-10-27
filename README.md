@@ -121,8 +121,10 @@ refused.
 ## Which conversation is using a box
 
 Ordinary MCP connections choose a random id when the adapter starts and send it as `X-Psbx-Agent` on every call. Registered native sessions keep one supervisor-owned id across all turns; the supervisor maintains its presence until it stops. After the first tool call
-it reports to `/v1/agents/<id>/heartbeat` once a minute, and when its conversation closes (stdin ends, or SIGTERM, SIGINT
-or SIGHUP) it reports `/v1/agents/<id>/leave`. The app uses this to tell a box the AI is still working in from one whose
+it is reported once a minute, and when its conversation closes (stdin ends, or SIGTERM, SIGINT
+or SIGHUP) it reports `/v1/agents/<id>/leave`. With the feedback relay below, the relay sends one `/v1/agents/heartbeat`
+a minute for every live adapter of the account on that machine (each adapter keeps a small presence file with its id and
+process); otherwise each adapter reports `/v1/agents/<id>/heartbeat` itself. The app uses this to tell a box the AI is still working in from one whose
 conversation was closed without `sandbox_review` or `sandbox_stop`; a conversation killed outright (no leave) counts as
 gone three minutes after its last heartbeat. Nothing else is sent: no prompt, no transcript.
 Restarting the client starts a new adapter with a new id, so a box the conversation used before the restart shows
@@ -174,7 +176,8 @@ registered native runner.
 After `sandbox_review` succeeds, App feedback for that review returns to the same conversation that asked for it. The same holds for each version drawn with `sandbox_draft`, `sandbox_architecture` or `sandbox_schema`: what the person circles and says about it in the App comes back to the conversation that drew it. A design belongs to the account
 and that conversation, not to a box: the design tools need no box `id`, and its feedback is routed the same way without one.
 The adapter writes a ticket (review, its box for a `sandbox_review` card, and the adapter's own agent id, no credentials) and starts one small local
-relay per account. The relay registers a feedback consumer for that conversation, claims submitted reports and hands
+relay per account. The relay registers a feedback consumer for that conversation, claims submitted reports (one long
+poll for all of the machine's conversations, `/v1/feedback-consumers/claim`; an older server gets one per conversation) and hands
 the conversation a short follow-up telling it which report to read with `sandbox_report`; that read marks the App
 receipt read. Each host only differs in how the follow-up enters the conversation:
 

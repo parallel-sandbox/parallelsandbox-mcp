@@ -15,6 +15,12 @@
 //               by Claude Desktop) is reported to the App as host_inactive, so the person can resume it.
 //               Each ticket binds on its own: one the server refuses never holds up the others.
 //   adapter  -> when that conversation reads the report with sandbox_report, acknowledges `read`.
+// One relay per machine and credential makes one long poll for all of its conversations (POST
+// /v1/feedback-consumers/claim) and one heartbeat a minute for every live adapter that registered with it
+// (POST /v1/agents/heartbeat). Until 10/27 it polled each conversation on its own, every 3 s for Claude Code: a Mac
+// with 62 reviewed conversations in the last 7 days sent 1,200 requests a minute, 98% of its traffic, and used up the
+// rate limit that every conversation on that machine shared. An older server without these routes still works:
+// one 25-second poll per conversation, one heartbeat per adapter.
 // Credentials stay in the adapter and relay environments; state files hold ids only.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -72,7 +78,10 @@ const ticketNames = (dir) => list(dir).filter((n) => n.endsWith(".json"));
 // One unreadable ticket must never stop the others from being considered.
 const ticketOrNull = (path) => { try { return readJson(path); } catch { return null; } };
 export function alive(pid) { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; } }
-export const paths = (dir) => ({ dir, tickets: join(dir, "tickets"), attach: join(dir, "attach"), journal: join(dir, "journal"), mail: join(dir, "mail"), run: join(dir, "run") });
+export const paths = (dir) => ({ dir, tickets: join(dir, "tickets"), attach: join(dir, "attach"), journal: join(dir, "journal"), mail: join(dir, "mail"), run: join(dir, "run"), presence: join(dir, "presence") });
+export const presenceFile = (dir, agentId) => join(paths(dir).presence, `${sha("presence", agentId).slice(0, 40)}.json`);
+// A relay writes this when it starts: an adapter hands its heartbeat only to a relay that sends it.
+export const relayFeaturesFile = (dir, credKey) => join(paths(dir).run, `relay-${credKey}.features`);
 
 // ---------- host identity ----------
 // Only host-supplied metadata picks the destination; tool arguments come from the model.
@@ -128,12 +137,26 @@ export function followUpText(event) {
 }
 
 // ---------- adapter side ----------
-export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, headers, env = process.env, dir = defaultFeedbackDir(env), spawnRelay = spawnDetachedRelay, findCli = hostCodexCli, log = () => {} }) {
+export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, headers, env = process.env, dir = defaultFeedbackDir(env), spawnRelay = spawnDetachedRelay, findCli = hostCodexCli, log = () => {}, pid = process.pid }) {
   const api = apiUrl.replace(/\/+$/, "");
   const p = paths(dir);
   const credKey = credentialKey(env, api, mcpUrl);
   let cliPromise;
   return {
+    // This adapter's minute heartbeat goes through the machine's relay together with every other live adapter's.
+    // Rewritten every minute (resume interval): the relay drops a file whose process is gone or that went quiet.
+    // Returns whether the relay sends it; when it does not (an older relay), the adapter keeps its own heartbeat.
+    async trackPresence({ client }) {
+      privateDir(dir); privateDir(p.presence);
+      writeJson(presenceFile(dir, agentId), { agentId, pid, client: client || "", apiUrl: api, mcpUrl, credKey, at: Date.now() });
+      const relay = await spawnRelay({ dir, credKey, env, log });
+      if (relay?.started) return true; // this package's relay
+      const features = ticketOrNull(relayFeaturesFile(dir, credKey));
+      return !!relay?.pid && features?.pid === relay.pid && features.presence === true;
+    },
+    dropPresence() {
+      orNull(() => unlinkSync(presenceFile(dir, agentId)));
+    },
     // Called after a successful sandbox_review or design version. Codex names its thread here; hook hosts attach later.
     async trackReview({ boxId, reviewId, clientName, meta }) {
       boxId = reviewBox(boxId, reviewId);
@@ -285,34 +308,55 @@ const retryableStatus = (status) => !status || status >= 500 || [401, 408, 425, 
 // A conversation just woken by one follow-up starts its next waiter at its next sandbox_report call, so a
 // waiter missing for a moment is normal; one still missing after this long means the conversation stopped.
 export const HOST_GRACE_MS = 30_000;
+// The server takes at most this many conversations in one claim; more are claimed in several requests at once.
+export const CLAIM_BATCH_MAX = 200;
+// The relay sends one heartbeat a minute for every live adapter on this machine (the server counts a
+// conversation gone after 3 minutes without one). A presence file not rewritten for this long is dropped.
+export const HEARTBEAT_MS = 60_000, PRESENCE_STALE_MS = 3 * 60_000;
+// A Claude Code conversation that is not running is checked again at most this often (ps per live waiter).
+const HOST_CHECK_MS = 5000;
+// An older server answers the batch routes with 404 (no such route) or 405.
+const missingRoute = (status) => status === 404 || status === 405;
+const chunks = (list, n) => { const out = []; for (let i = 0; i < list.length; i += n) out.push(list.slice(i, i + n)); return out; };
 
-export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, hostGraceMs = HOST_GRACE_MS, waiting = waiterRunning, signal, print = console.log }) {
+export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, hostGraceMs = HOST_GRACE_MS, heartbeatMs = HEARTBEAT_MS, waiting = waiterRunning, signal, print = console.log }) {
   const p = paths(dir);
   privateDir(p.run); privateDir(p.journal); privateDir(p.mail);
   const pidFile = join(p.run, `relay-${credKey}.pid`);
+  const featuresFile = relayFeaturesFile(dir, credKey);
   const say = (...a) => print(stamp(), ...a);
   const owner = Number(orNull(() => readFileSync(pidFile, "utf8")) || 0);
   if (owner && owner !== process.pid && alive(owner)) { say("another relay owns", credKey); return; }
   writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
+  if (!once) writeJson(featuresFile, { pid: process.pid, presence: true, batchClaim: true });
   const controller = new AbortController();
   if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener("abort", () => controller.abort(), { once: true }); }
-  const loops = new Map(); // consumerId -> promise
+  const consumers = new Map(); // consumerId -> { id, agentId, ticket, target }: every conversation the one claim asks for
   const bound = new Set(); // consumerId/ticket
+  const gone = new Set(); // consumers the server no longer has for their agent: never asked again by this relay
+  const legacy = new Map(); // consumerId -> its own poll, only against a server without the batch claim
   // Tickets that could not be bound or read, by ticket key: { sig, message, retryAt, delay }.
   // retryAt is Infinity for a refusal: that ticket is tried again only after its file changes (sig).
   const setAside = new Map();
-  let fetcher = fetchImpl, lastWork = Date.now();
+  let fetcher = fetchImpl, lastWork = Date.now(), batch = true, claimWake = null;
   try {
-    const request = async (ticket, agentId, path, body) => {
+    const fetcherFor = async (mcpUrl) => {
       if (!fetcher) {
         if (env.PARALLELSANDBOX_API_KEY) fetcher = (url, init) => fetch(url, { ...init, headers: { ...init.headers, Authorization: `Bearer ${env.PARALLELSANDBOX_API_KEY}` } });
-        else { const { OAuthSession } = await import("./oauth.mjs"); const oauth = new OAuthSession({ mcpUrl: ticket.mcpUrl, open: () => {} }); fetcher = (url, init) => oauth.fetch(url, init); }
+        else { const { OAuthSession } = await import("./oauth.mjs"); const oauth = new OAuthSession({ mcpUrl, open: () => {} }); fetcher = (url, init) => oauth.fetch(url, init); }
       }
-      const res = await fetcher(`${ticket.apiUrl}/v1/feedback-consumers${path}`, { method: "POST", headers: { "Content-Type": "application/json", "X-Psbx-Agent": agentId, "X-Psbx-Client": "parallelsandbox-feedback-relay" }, body: JSON.stringify(body), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(40_000)]) });
+      return fetcher;
+    };
+    // One POST to the control API; `wake` cuts a long poll short when the set of conversations changed.
+    const call = async ({ apiUrl, mcpUrl }, agentId, path, body, wake) => {
+      const f = await fetcherFor(mcpUrl);
+      const signals = [controller.signal, AbortSignal.timeout(40_000), ...(wake ? [wake] : [])];
+      const res = await f(`${apiUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...(agentId ? { "X-Psbx-Agent": agentId } : {}), "X-Psbx-Client": "parallelsandbox-feedback-relay" }, body: JSON.stringify(body), signal: AbortSignal.any(signals) });
       const data = res.status === 204 ? {} : await res.json().catch(() => ({}));
       if (!res.ok) { const err = new Error(data.error || `HTTP ${res.status}`); err.status = res.status; throw err; }
       return data;
     };
+    const request = (ticket, agentId, path, body) => call(ticket, agentId, `/v1/feedback-consumers${path}`, body);
     const targetOf = (ticket, key) => {
       if (ticket.codex) return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
       const a = ticketOrNull(join(p.attach, `${key}.json`));
@@ -348,63 +392,167 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         say("acknowledged", event.reportId, j.state);
       }
     };
-    // Mailed events are acknowledged as soon as their conversation takes them.
-    const ackHanded = async (consumer) => {
-      for (const name of list(p.journal)) {
-        const jpath = join(p.journal, name);
-        const j = orNull(() => readJson(jpath));
-        if (!j || j.consumerId !== consumer.id || j.state !== "mailed") continue;
-        if (!existsSync(join(p.mail, sessionKey(j.host, j.target), `${j.eventId}.handed`))) continue;
-        try {
-          await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/ack`, { eventId: j.eventId, reportId: j.reportId, leaseToken: j.leaseToken, state: "host_accepted" });
-          writeJson(jpath, { ...j, state: "accepted", acceptedAt: Date.now() });
-          say("acknowledged", j.reportId, "accepted");
-        } catch (err) { if (err.status !== 409) throw err; } // Lease expired: the next claim renews it.
-      }
-    };
     // Claude Code takes a mailed follow-up only through a live waiter. While none runs, the conversation is not
     // running (closed, or stopped by Claude Desktop while idle) and the App asks the person to send it a message;
     // the follow-up stays mailed for the waiter that starts when the conversation runs again.
     let hostReports = true;
-    const reportHost = async (consumer) => {
-      if (!hostReports || consumer.target.host !== "claude-code") return;
+    const hostChecked = new Map(); // eventId -> last check, so a long-running relay runs ps at most every HOST_CHECK_MS
+    const reportHost = async (consumer, j, jpath) => {
+      if (!hostReports || consumer.target.host !== "claude-code" || Date.now() - (j.mailedAt || 0) < hostGraceMs) return;
+      if (!once) { if (Date.now() - (hostChecked.get(j.eventId) || 0) < HOST_CHECK_MS) return; hostChecked.set(j.eventId, Date.now()); }
+      const inactive = !(await waiting({ dir, host: j.host, session: j.target }));
+      if (inactive === !!j.hostInactive) return;
+      try {
+        await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/ack`, { eventId: j.eventId, reportId: j.reportId, leaseToken: j.leaseToken, state: inactive ? "host_inactive" : "host_active" });
+      } catch (err) {
+        if (err.status === 400) { hostReports = false; say("this server does not take conversation status:", err.message); return; }
+        if (err.status === 404 || err.status === 409) return; // Lease expired or taken: the next claim renews it.
+        throw err;
+      }
+      const now = orNull(() => readJson(jpath));
+      if (now?.state === "mailed") writeJson(jpath, { ...now, hostInactive: inactive });
+      say("reported", j.reportId, inactive ? "conversation is not running" : "conversation is running again", j.host, j.target);
+    };
+    // Mailed follow-ups are acknowledged as soon as their conversation takes them, and a Claude Code conversation
+    // that does not take one is reported. One pass over the journal for every conversation, from the scan loop:
+    // local files only, and a request only when something changed (a failed one backs off per event).
+    const retryAt = new Map(); // eventId -> { at, delay }
+    const settle = async () => {
+      let firstError = null;
       for (const name of list(p.journal)) {
+        if (controller.signal.aborted) break;
         const jpath = join(p.journal, name);
         const j = orNull(() => readJson(jpath));
-        if (!j || j.consumerId !== consumer.id || j.state !== "mailed" || Date.now() - (j.mailedAt || 0) < hostGraceMs) continue;
-        if (existsSync(join(p.mail, sessionKey(j.host, j.target), `${j.eventId}.handed`))) continue;
-        const inactive = !(await waiting({ dir, host: j.host, session: j.target }));
-        if (inactive === !!j.hostInactive) continue;
+        if (!j || j.state !== "mailed") continue;
+        const consumer = consumers.get(j.consumerId);
+        if (!consumer) continue;
+        const retry = retryAt.get(j.eventId);
+        if (retry && Date.now() < retry.at) continue;
         try {
-          await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/ack`, { eventId: j.eventId, reportId: j.reportId, leaseToken: j.leaseToken, state: inactive ? "host_inactive" : "host_active" });
+          if (existsSync(join(p.mail, sessionKey(j.host, j.target), `${j.eventId}.handed`))) {
+            try {
+              await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/ack`, { eventId: j.eventId, reportId: j.reportId, leaseToken: j.leaseToken, state: "host_accepted" });
+              writeJson(jpath, { ...j, state: "accepted", acceptedAt: Date.now() });
+              say("acknowledged", j.reportId, "accepted");
+            } catch (err) { if (err.status !== 409) throw err; } // Lease expired: the next claim renews it.
+          } else await reportHost(consumer, j, jpath);
+          retryAt.delete(j.eventId);
         } catch (err) {
-          if (err.status === 400) { hostReports = false; say("this server does not take conversation status:", err.message); return; }
-          if (err.status === 404 || err.status === 409) continue; // Lease expired or taken: the next claim renews it.
+          if (controller.signal.aborted) break;
+          const delay = retry ? Math.min(retry.delay * 2, 60_000) : 1000;
+          retryAt.set(j.eventId, { at: Date.now() + delay, delay });
+          say("delivery pending:", err.message);
+          firstError ||= err;
+        }
+      }
+      return firstError;
+    };
+    // One claim for every conversation of this relay (in chunks of CLAIM_BATCH_MAX, asked at the same time).
+    // A chunk that brings events wakes the others, so the next round starts at once; a report the server leased
+    // to a request cut short that way is claimed again when its lease runs out. Returns the events and the
+    // first delivery error (logged here; a one-shot run reports it).
+    const claimAll = async (wake) => {
+      let events = 0, deliveryError = null;
+      await Promise.all(chunks([...consumers.values()], CLAIM_BATCH_MAX).map(async (chunk) => {
+        let data;
+        try {
+          data = await call(chunk[0].ticket, "", "/v1/feedback-consumers/claim", { consumers: chunk.map((c) => ({ consumerId: c.id, agentId: c.agentId })), waitSec: once ? 0 : claimWaitSec }, wake?.signal);
+        } catch (err) {
+          if (wake?.signal.aborted && !controller.signal.aborted) return;
+          if (missingRoute(err.status)) { batch = false; return; }
           throw err;
         }
-        const now = orNull(() => readJson(jpath));
-        if (now?.state === "mailed") writeJson(jpath, { ...now, hostInactive: inactive });
-        say("reported", j.reportId, inactive ? "conversation is not running" : "conversation is running again", j.host, j.target);
-      }
+        for (const id of data.gone || []) {
+          gone.add(id);
+          if (consumers.delete(id)) say("consumer is gone:", id);
+        }
+        for (const event of data.events || []) {
+          const consumer = consumers.get(event.consumerId);
+          if (!consumer) continue;
+          events++; lastWork = Date.now();
+          try { await deliver(consumer, event); }
+          catch (err) { if (controller.signal.aborted) return; say("delivery pending:", err.message); deliveryError ||= err; }
+        }
+        if (events) wake?.abort();
+      }));
+      return { events, deliveryError };
     };
+    const claimLoop = async () => {
+      let backoff = 1000;
+      while (!controller.signal.aborted && batch) {
+        const wake = new AbortController();
+        claimWake = wake;
+        const started = Date.now();
+        try {
+          const { events } = consumers.size ? await claimAll(wake) : { events: 0 };
+          backoff = 1000;
+          if (!batch) break;
+          // Nothing to ask for, or a server that answered at once: wait a moment (a new conversation wakes it).
+          if (!events && !wake.signal.aborted && Date.now() - started < 1000) await sleep(Math.max(scanMs, 1000), AbortSignal.any([controller.signal, wake.signal]));
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          say("delivery pending:", err.message);
+          await sleep(backoff, controller.signal); backoff = Math.min(backoff * 2, 60_000);
+        } finally { if (claimWake === wake) claimWake = null; }
+      }
+      if (!batch && !controller.signal.aborted) say("this server has no batch claim: one long poll per conversation");
+    };
+    // Against an older server: one long poll per conversation, the full claimWaitSec for every host (it was
+    // 3 s for hook hosts so that follow-ups taken meanwhile were acknowledged quickly; settle does that now).
     const consume = async (consumer) => {
       let backoff = 1000;
-      while (!controller.signal.aborted) {
+      while (!controller.signal.aborted && consumers.has(consumer.id)) {
         try {
-          await ackHanded(consumer);
-          const { events = [] } = await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/claim`, { waitSec: once ? 0 : (consumer.target.kind === "hook" ? Math.min(claimWaitSec, 3) : claimWaitSec) });
+          const { events = [] } = await request(consumer.ticket, consumer.agentId, `/${encodeURIComponent(consumer.id)}/claim`, { waitSec: once ? 0 : claimWaitSec });
           for (const event of events) { lastWork = Date.now(); await deliver(consumer, event); }
-          await ackHanded(consumer);
-          await reportHost(consumer);
           backoff = 1000;
           if (once) return;
         } catch (err) {
           if (controller.signal.aborted) return;
-          if (err.status === 404 || err.status === 403) { say("consumer is gone:", consumer.id, err.message); return; }
+          if (err.status === 404 || err.status === 403) { say("consumer is gone:", consumer.id, err.message); gone.add(consumer.id); consumers.delete(consumer.id); return; }
           say("delivery pending:", err.message);
           if (once) throw err;
           await sleep(backoff, controller.signal); backoff = Math.min(backoff * 2, 60_000);
         }
+      }
+    };
+    // Every live adapter of this credential on this machine, in one heartbeat a minute.
+    const livePresences = () => {
+      const out = [];
+      for (const name of list(p.presence)) {
+        if (!name.endsWith(".json")) continue;
+        const path = join(p.presence, name);
+        const a = ticketOrNull(path);
+        if (!a || a.credKey !== credKey) continue;
+        if (!alive(a.pid) || Date.now() - (a.at || 0) > PRESENCE_STALE_MS) { orNull(() => unlinkSync(path)); continue; }
+        out.push(a);
+      }
+      return out;
+    };
+    const presenceLoop = async () => {
+      let batchBeats = true, lastError = "";
+      while (!controller.signal.aborted) {
+        const live = livePresences();
+        if (live.length) {
+          try {
+            if (batchBeats) {
+              try {
+                for (const chunk of chunks(live, CLAIM_BATCH_MAX)) await call(chunk[0], "", "/v1/agents/heartbeat", { agents: chunk.map((a) => ({ id: a.agentId, client: a.client || "" })) });
+              } catch (err) {
+                if (!missingRoute(err.status)) throw err;
+                batchBeats = false;
+                say("this server has no batch heartbeat: one per conversation");
+              }
+            }
+            if (!batchBeats) for (const a of live) await call(a, a.agentId, `/v1/agents/${encodeURIComponent(a.agentId)}/heartbeat`, { client: a.client || "" });
+            lastError = "";
+          } catch (err) {
+            if (controller.signal.aborted) return;
+            if (err.message !== lastError) say("heartbeat failed:", err.message);
+            lastError = err.message;
+          }
+        }
+        await sleep(heartbeatMs, controller.signal);
       }
     };
     // Records one ticket that could not be read or bound. It is logged the first time, and again only when the
@@ -421,10 +569,11 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
     // Every ticket is handled on its own: one that cannot be read or bound never holds up the others.
     // A ticket set aside still counts as active, like a ticket whose conversation has not attached yet:
     // every unexpired ticket keeps the relay up, matching resumeRelay, which would otherwise start a new relay
-    // that tries the same ticket again a minute later.
+    // that tries the same ticket again a minute later. A conversation none of whose tickets is left (expired,
+    // removed) is no longer asked for.
     const scan = async () => {
-      let active = 0, firstError = null;
-      const seen = new Set();
+      let active = 0, firstError = null, changed = false;
+      const seen = new Set(), wanted = new Set();
       for (const name of ticketNames(p.tickets)) {
         if (controller.signal.aborted) break;
         const key = name.slice(0, -".json".length), path = join(p.tickets, name);
@@ -443,6 +592,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         const target = targetOf(ticket, key);
         if (!target) continue;
         const consumerId = `fr_${sha("consumer", ticket.agentId, target.host, target.id).slice(0, 40)}`;
+        if (gone.has(consumerId)) continue;
         const bindKey = `${consumerId}/${key}`;
         if (!bound.has(bindKey)) {
           const sig = sha(JSON.stringify(ticket), target.host, target.id, st.mtimeMs);
@@ -461,31 +611,48 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
           lastWork = Date.now();
           say("bound review", ticket.reviewId, "to", target.host, target.id);
         }
-        if (!loops.has(consumerId)) {
-          const consumer = { id: consumerId, agentId: ticket.agentId, ticket, target };
-          const loop = consume(consumer).finally(() => loops.delete(consumerId));
-          loops.set(consumerId, loop);
-          if (once) { try { await loop; } catch (err) { firstError ||= err; } }
-        }
+        wanted.add(consumerId);
+        if (!consumers.has(consumerId)) { consumers.set(consumerId, { id: consumerId, agentId: ticket.agentId, ticket, target }); changed = true; }
       }
       for (const key of setAside.keys()) if (!seen.has(key)) setAside.delete(key);
-      // A one-shot run (tests, diagnostics) still reports the first failure, after every other ticket was handled.
-      if (once && firstError) throw firstError;
-      return active;
+      if (!controller.signal.aborted) for (const id of consumers.keys()) if (!wanted.has(id)) { consumers.delete(id); changed = true; }
+      return { active, firstError, changed };
     };
     say("relay started", credKey);
+    if (once) {
+      // One pass (tests, diagnostics): bind, claim without waiting, deliver, settle; the first failure is reported
+      // after every other ticket was handled.
+      const errors = [(await scan()).firstError];
+      try { errors.push((await claimAll(null)).deliveryError); } catch (err) { errors.push(err); }
+      if (!batch) for (const c of [...consumers.values()]) { try { await consume(c); } catch (err) { errors.push(err); } }
+      errors.push(await settle());
+      const firstError = errors.find(Boolean);
+      if (firstError) throw firstError;
+      return;
+    }
+    const loops = [claimLoop(), presenceLoop()];
     while (!controller.signal.aborted) {
       if (!existsSync(dir)) { say("state directory removed; relay exits"); break; }
       let active = 0;
-      try { active = await scan(); } catch (err) { say("scan:", err.message); if (once) throw err; }
-      if (once) break;
-      if (!active && !loops.size && Date.now() - lastWork > idleExitMs) { say("no pending reviews; relay exits"); break; }
+      try {
+        const scanned = await scan();
+        active = scanned.active;
+        if (scanned.changed) claimWake?.abort(); // the long poll asks again with the new set of conversations
+        if (!batch) for (const c of consumers.values()) if (!legacy.has(c.id)) legacy.set(c.id, consume(c).finally(() => legacy.delete(c.id)));
+        await settle();
+      } catch (err) { say("scan:", err.message); }
+      if (!active && !consumers.size && !legacy.size && !livePresences().length && Date.now() - lastWork > idleExitMs) { say("no pending reviews or live conversations; relay exits"); break; }
       await sleep(scanMs, controller.signal);
     }
+    controller.abort();
+    await Promise.allSettled([...loops, ...legacy.values()]);
   } finally {
     controller.abort();
-    await Promise.allSettled([...loops.values()]);
-    if (Number(orNull(() => readFileSync(pidFile, "utf8"))) === process.pid) orNull(() => unlinkSync(pidFile));
+    await Promise.allSettled([...legacy.values()]);
+    if (Number(orNull(() => readFileSync(pidFile, "utf8"))) === process.pid) {
+      orNull(() => unlinkSync(pidFile));
+      if (ticketOrNull(featuresFile)?.pid === process.pid) orNull(() => unlinkSync(featuresFile));
+    }
   }
 }
 

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once as onceEvent } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, followUpText, hostCodexCli, mailFor, paths, readJson, runRelay, takeMail, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
+import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, credentialKey, followUpText, hostCodexCli, mailFor, paths, presenceFile, PRESENCE_STALE_MS, readJson, relayFeaturesFile, runRelay, takeMail, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
 import { foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
 import { hooksInstalled, hostConfig, hostFromClient, install, installNote, mergeHooks, reviewInstallNote, selfCommand, setupInstructions } from "./feedback-install.mjs";
 
@@ -18,19 +18,33 @@ const route = (dir, over = {}) => createFeedbackRoute({ apiUrl: "https://api.tes
 const credOf = (dir, box = "box1", review = "rev1") => readJson(join(paths(dir).tickets, `${ticketKey(box, review)}.json`)).credKey;
 
 // A fake backend: one report waits on each bound review until acknowledged. Conversation status
-// (host_inactive / host_active) is recorded apart: it acknowledges nothing.
-function backend(reports, { hostStatus = true } = {}) {
-  const calls = [], bound = new Map(), acked = new Map(), host = [];
+// (host_inactive / host_active) is recorded apart: it acknowledges nothing. `batch: false` is a server from
+// before the one-claim-per-machine and one-heartbeat-per-machine routes (they answer 404).
+function backend(reports, { hostStatus = true, batch = true } = {}) {
+  const calls = [], bound = new Map(), acked = new Map(), host = [], beats = [];
   let lease = 0;
+  // A review card's event carries its box; a design version's carries its design instead.
+  const eventFor = (consumer) => {
+    const r = reports.find((x) => bound.get(x.reviewId) === consumer && !acked.has(x.reportId));
+    return r ? { eventId: `ev-${r.reportId}`, ...(r.designId ? { designId: r.designId } : { boxId: r.boxId }), reviewId: r.reviewId, reportId: r.reportId, leaseToken: `l${++lease}` } : null;
+  };
   const fetchImpl = async (url, init) => {
     const body = JSON.parse(init.body), path = new URL(url).pathname, agent = init.headers["X-Psbx-Agent"];
     calls.push({ path, body, agent });
     if (path === "/v1/feedback-consumers") { bound.set(body.reviewId, body.consumerId); return json(200, { ok: true }); }
+    if (path === "/v1/feedback-consumers/claim") {
+      if (!batch) return json(404, {});
+      return json(200, { events: body.consumers.map((c) => { const e = eventFor(c.consumerId); return e && { consumerId: c.consumerId, ...e }; }).filter(Boolean), gone: [] });
+    }
+    if (path === "/v1/agents/heartbeat") {
+      if (!batch) return json(404, {});
+      beats.push(body.agents.map((a) => a.id)); return json(200, { ok: true, count: body.agents.length });
+    }
+    if (/^\/v1\/agents\/[^/]+\/heartbeat$/.test(path)) { beats.push([decodeURIComponent(path.split("/")[3])]); return json(200, { ok: true }); }
     const consumer = decodeURIComponent(path.split("/")[3]);
     if (path.endsWith("/claim")) {
-      const r = reports.find((x) => bound.get(x.reviewId) === consumer && !acked.has(x.reportId));
-      // A review card's event carries its box; a design version's carries its design instead.
-      return json(200, { events: r ? [{ eventId: `ev-${r.reportId}`, ...(r.designId ? { designId: r.designId } : { boxId: r.boxId }), reviewId: r.reviewId, reportId: r.reportId, leaseToken: `l${++lease}` }] : [] });
+      const e = eventFor(consumer);
+      return json(200, { events: e ? [e] : [] });
     }
     if (path.endsWith("/ack") && body.state.startsWith("host_") && body.state !== "host_accepted") {
       if (!hostStatus) return json(400, { error: "state must be host_accepted or read" });
@@ -39,7 +53,7 @@ function backend(reports, { hostStatus = true } = {}) {
     if (path.endsWith("/ack")) { acked.set(body.reportId, body.state); return json(200, { ok: true }); }
     return json(404, {});
   };
-  return { fetchImpl, calls, bound, acked, host };
+  return { fetchImpl, calls, bound, acked, host, beats };
 }
 
 test("thread comes only from Codex tools/call _meta", () => {
@@ -69,7 +83,8 @@ test("Codex review: ticket names the thread, relay queues one follow-up and ackn
   assert.equal(be.bound.get("rev1").slice(0, 3), "fr_");
   assert.equal(be.calls[0].body.host, "codex");
   assert.equal(be.acked.get(RID), "host_accepted");
-  assert.ok(be.calls.every((c) => c.agent === "agentA"));
+  // Every call is made as the conversation's own agent; the one claim for the machine names it per consumer.
+  assert.ok(be.calls.every((c) => c.agent === "agentA" || (c.path === "/v1/feedback-consumers/claim" && c.agent === undefined && c.body.consumers.every((x) => x.agentId === "agentA"))));
 });
 
 test("hook host: nothing is registered until the conversation's hook attaches", async () => {
@@ -617,4 +632,154 @@ test("resuming another agent's review keeps its original ticket; the same agent 
   const taken = await other.trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
   assert.equal(readJson(file).agentId, "agentB", "an expired ticket no longer holds the route");
   assert.equal(taken.automatic, "when_hooks_installed");
+});
+
+// ---------- one long poll and one heartbeat per machine (10/27: one poll per conversation, every 3 s for Claude Code) ----------
+const claimsOf = (be) => be.calls.filter((c) => c.path.endsWith("/claim"));
+const credFor = () => credentialKey({ PARALLELSANDBOX_API_KEY: "k" }, "https://api.test", "https://mcp.test/mcp");
+
+test("the relay asks for every conversation in one claim, and stops asking for one whose tickets are gone", async () => {
+  const dir = tmp();
+  const reviews = await threeReviews(dir);
+  const be = backend(reviews.map(reportFor));
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: () => {} });
+  const [claim, ...more] = claimsOf(be);
+  assert.equal(more.length, 0, "one request for three conversations");
+  assert.equal(claim.path, "/v1/feedback-consumers/claim");
+  assert.equal(claim.body.consumers.length, 3);
+  assert.ok(claim.body.consumers.every((c) => c.agentId === "agentA" && c.consumerId.startsWith("fr_")));
+  reviews.forEach((_, i) => assert.equal(mailedTo(dir, i), 1));
+  unlinkSync(join(paths(dir).tickets, `${ticketKey("box1", "rev3")}.json`));
+  be.calls.length = 0;
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: () => {} });
+  assert.equal(claimsOf(be)[0].body.consumers.length, 2, "the removed review's conversation is not asked for");
+});
+
+test("a consumer the server no longer has is never asked for again", async () => {
+  const dir = tmp();
+  const reviews = await threeReviews(dir);
+  const be = backend(reviews.map(reportFor));
+  let goneId = "";
+  const asked = []; // how many conversations each claim named
+  const fetchImpl = async (url, init) => {
+    if (new URL(url).pathname !== "/v1/feedback-consumers/claim") return be.fetchImpl(url, init);
+    const body = JSON.parse(init.body);
+    asked.push(body.consumers.length);
+    goneId ||= body.consumers[0].consumerId;
+    await pause(10);
+    const res = await (await be.fetchImpl(url, { ...init, body: JSON.stringify({ ...body, consumers: body.consumers.filter((c) => c.consumerId !== goneId) }) })).json();
+    return json(200, { ...res, gone: body.consumers.some((c) => c.consumerId === goneId) ? [goneId] : [] });
+  };
+  const lines = [];
+  const stop = new AbortController();
+  const running = runRelay({ dir, credKey: credOf(dir), fetchImpl, scanMs: 5, signal: stop.signal, print: (...a) => lines.push(a.join(" ")) });
+  await until(() => asked.length >= 3);
+  stop.abort();
+  await running;
+  assert.equal(asked[0], 3);
+  assert.ok(asked.slice(1).every((n) => n === 2), `asked once, then left out: ${asked}`);
+  assert.equal(lines.filter((l) => l.includes(`consumer is gone: ${goneId}`)).length, 1);
+});
+
+test("an older server without the batch claim gets one 25-second poll per conversation, never 3 seconds", async () => {
+  const dir = tmp();
+  const reviews = await threeReviews(dir);
+  const be = backend(reviews.map(reportFor), { batch: false });
+  const fetchImpl = async (url, init) => { if (url.endsWith("/claim")) await pause(10); return be.fetchImpl(url, init); };
+  const lines = [];
+  const stop = new AbortController();
+  const running = runRelay({ dir, credKey: credOf(dir), fetchImpl, scanMs: 5, signal: stop.signal, print: (...a) => lines.push(a.join(" ")) });
+  await until(() => reviews.every((_, i) => mailedTo(dir, i) === 1));
+  stop.abort();
+  await running;
+  assert.equal(claimsOf(be).filter((c) => c.path === "/v1/feedback-consumers/claim").length, 1, "the batch route is tried once");
+  const own = claimsOf(be).filter((c) => c.path !== "/v1/feedback-consumers/claim");
+  assert.ok(own.length >= 3 && own.every((c) => c.body.waitSec === 25 && c.agent === "agentA"), JSON.stringify(own.map((c) => c.body)));
+  assert.ok(lines.some((l) => l.includes("this server has no batch claim")));
+  // A one-shot run against that server still delivers.
+  const once = backend(reviews.map(reportFor), { batch: false });
+  const dir2 = tmp();
+  await threeReviews(dir2);
+  await runRelay({ dir: dir2, credKey: credOf(dir2), fetchImpl: once.fetchImpl, once: true, print: () => {} });
+  reviews.forEach((_, i) => assert.equal(mailedTo(dir2, i), 1));
+});
+
+test("a follow-up the conversation takes while the claim is waiting is acknowledged at once", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: "rev1" });
+  const be = backend([reportFor("rev1")]);
+  let claims = 0;
+  // The first claim hands the report out; later ones wait like the server does, until woken.
+  const fetchImpl = async (url, init) => {
+    if (url.endsWith("/claim") && claims++ > 0) {
+      await new Promise((r) => { const t = setTimeout(r, 2000); init.signal?.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true }); });
+      return json(200, { events: [], gone: [] });
+    }
+    return be.fetchImpl(url, init);
+  };
+  const stop = new AbortController();
+  const running = runRelay({ dir, credKey: credOf(dir), fetchImpl, scanMs: 5, signal: stop.signal, print: () => {} });
+  await until(() => mailedTo(dir, 0) === 1);
+  await until(() => claims >= 2);
+  const started = Date.now();
+  assert.equal(takeMail(mailFor({ dir, host: "claude-code", session: "S1" })[0], "w"), true);
+  await until(() => be.acked.get("rev1-report") === "host_accepted", 1000);
+  assert.ok(Date.now() - started < 1000, "not held until the long poll ends");
+  stop.abort();
+  await running;
+});
+
+test("the relay sends one heartbeat a minute for every live adapter on the machine; an older server gets one per adapter", async () => {
+  for (const batch of [true, false]) {
+    const dir = tmp();
+    const credKey = credFor();
+    await route(dir, { agentId: "agentA" }).trackPresence({ client: "claude-code/2.1" });
+    await route(dir, { agentId: "agentDead", pid: 999999 }).trackPresence({ client: "" });
+    await route(dir, { agentId: "agentQuiet" }).trackPresence({ client: "" });
+    const quiet = presenceFile(dir, "agentQuiet");
+    writeJson(quiet, { ...readJson(quiet), at: Date.now() - PRESENCE_STALE_MS - 1000 });
+    const be = backend([], { batch });
+    const stop = new AbortController();
+    const running = runRelay({ dir, credKey, fetchImpl: be.fetchImpl, scanMs: 5, heartbeatMs: 20, signal: stop.signal, print: () => {} });
+    await until(() => be.beats.length >= 2);
+    stop.abort();
+    await running;
+    assert.ok(be.beats.every((ids) => ids.length === 1 && ids[0] === "agentA"), JSON.stringify(be.beats));
+    assert.equal(existsSync(presenceFile(dir, "agentDead")), false, "a process that is gone is dropped");
+    assert.equal(existsSync(quiet), false, "a presence not rewritten for three minutes is dropped");
+    const beat = be.calls.find((c) => c.path.includes("heartbeat") && (batch ? c.path === "/v1/agents/heartbeat" : true));
+    if (batch) assert.deepEqual([beat.agent, beat.body], [undefined, { agents: [{ id: "agentA", client: "claude-code/2.1" }] }]);
+    else assert.ok(be.calls.some((c) => c.path === "/v1/agents/agentA/heartbeat" && c.agent === "agentA" && c.body.client === "claude-code/2.1"));
+  }
+});
+
+test("a relay stays up while a conversation on the machine is live, and says it sends heartbeats", async () => {
+  const dir = tmp();
+  const credKey = credFor();
+  const a = route(dir, { agentId: "agentA" });
+  await a.trackPresence({ client: "" });
+  let finished = false;
+  const running = runRelay({ dir, credKey, fetchImpl: backend([]).fetchImpl, scanMs: 5, heartbeatMs: 20, idleExitMs: 10, print: () => {} }).then(() => { finished = true; });
+  await pause(150);
+  assert.equal(finished, false, "a live conversation keeps the relay up");
+  assert.deepEqual(readJson(relayFeaturesFile(dir, credKey)), { pid: process.pid, presence: true, batchClaim: true });
+  a.dropPresence();
+  await until(() => finished);
+  await running;
+  assert.equal(existsSync(relayFeaturesFile(dir, credKey)), false);
+});
+
+test("an adapter hands its heartbeat only to a relay that sends it", async () => {
+  const dir = tmp();
+  mkdirSync(paths(dir).run, { recursive: true });
+  const started = route(dir, { spawnRelay: async () => ({ running: true, pid: 4242, started: true }) });
+  assert.equal(await started.trackPresence({ client: "" }), true, "a relay this package just started");
+  const running = route(dir, { spawnRelay: async () => ({ running: true, pid: 4242, started: false }) });
+  assert.equal(await running.trackPresence({ client: "" }), false, "an older relay that was already running");
+  writeJson(relayFeaturesFile(dir, credFor()), { pid: 4242, presence: true });
+  assert.equal(await running.trackPresence({ client: "" }), true);
+  writeJson(relayFeaturesFile(dir, credFor()), { pid: 999, presence: true });
+  assert.equal(await running.trackPresence({ client: "" }), false, "the features file of a relay that is gone");
+  assert.equal(readJson(presenceFile(dir, "agentA")).pid, process.pid);
 });

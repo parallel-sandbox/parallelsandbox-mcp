@@ -280,7 +280,7 @@ const log = (...args) => console.error("[parallelsandbox-mcp]", ...args);
 const oauth = API_KEY ? null : new OAuthSession({ mcpUrl: MCP_URL, log });
 const authorizedFetch = (url, init) => oauth ? oauth.fetch(url, init) : fetch(url, init);
 
-const remote = new Client({ name: "parallelsandbox-mcp", version: "0.6.0" });
+const remote = new Client({ name: "parallelsandbox-mcp", version: "0.7.0" });
 // 同一個 headers 物件每次請求都會被讀到，所以握手拿到對方是誰之後直接塞進去。
 // 沒有這個，control 只知道「某個 API key 開了箱子」，人在 app 裡看不出是 Claude 還是 Codex 在用。
 const managedSession = sessionBridge();
@@ -424,7 +424,8 @@ async function callWatched(name, args, timeout, onAlive, signal) {
 }
 
 // 這個對話還在不在（control 的 agents 表）。一個 adapter 程序就是一個對話：啟動時取一個隨機 id 放在 X-Psbx-Agent，
-// control 記下每個箱子最後是哪個對話在動。第一次呼叫工具之後每分鐘打一次心跳；對話被關掉（stdin 斷、收到結束訊號）
+// control 記下每個箱子最後是哪個對話在動。第一次呼叫工具之後每分鐘有一次心跳（有回饋 relay 時由它替整台機器一起打，
+// 見 refreshPresence）；對話被關掉（stdin 斷、收到結束訊號）
 // 就打 leave，這個對話動過、沒交件也沒收掉的箱子，在 app 上變成「AI 停手了」，人一看就知道要接著做還是收掉。
 // kill -9 來不及打 leave，control 三分鐘沒收到心跳也會當它走了。
 const AGENT_ID = managedSession?.agentId || randomBytes(9).toString("base64url");
@@ -448,14 +449,37 @@ async function presence(what, timeoutMs) {
 }
 
 // startPresence 在第一次呼叫工具時才開始跳：只是設定了 MCP、從沒用過箱子的對話不必每分鐘打來。
+let presenceStarted = false;
 function startPresence() {
   // A managed native turn is a temporary writer; its supervisor owns the
   // original conversation's presence while waiting between these processes.
   if (managedSession) return;
-  if (heartbeat) return;
+  if (presenceStarted) return;
+  presenceStarted = true;
   presence("heartbeat", 10_000);
-  heartbeat = setInterval(() => presence("heartbeat", 10_000), HEARTBEAT_MS);
-  heartbeat.unref();
+  refreshPresence();
+}
+
+// refreshPresence：有回饋 relay（feedbackRoute）就把這個對話登記給它，由這台機器的 relay 每分鐘一次替所有活著的 adapter
+// 一起打心跳（10/27 之前每個 adapter 各打各的）；relay 是舊版、起不來，或沒有 feedbackRoute，就自己每分鐘打。
+// 每分鐘（feedbackRoute 的 resume）重來一次：relay 換新版、掛掉重開，都跟得上。
+async function refreshPresence() {
+  let viaRelay = false;
+  if (feedbackRoute) {
+    try {
+      viaRelay = await feedbackRoute.trackPresence({ client: remoteHeaders["X-Psbx-Client"] || "" });
+    } catch (err) {
+      log("presence via the feedback relay:", err?.message || err);
+    }
+  }
+  if (viaRelay && heartbeat) {
+    clearInterval(heartbeat);
+    heartbeat = null;
+  }
+  if (!viaRelay && !heartbeat) {
+    heartbeat = setInterval(() => presence("heartbeat", 10_000), HEARTBEAT_MS);
+    heartbeat.unref();
+  }
 }
 
 let leaving = false;
@@ -466,8 +490,9 @@ async function leaveAndExit(code) {
   leaving = true;
   await claudeChannel?.shutdown();
   await codexFeedback?.stop();
-  if (heartbeat) {
+  if (presenceStarted) {
     clearInterval(heartbeat);
+    try { feedbackRoute?.dropPresence(); } catch {}
     await presence("leave", 2_000);
   }
   process.exit(code);
@@ -1846,7 +1871,7 @@ if (connect && API_KEY) await connectRemote();
 const feedbackHost = process.env.PSBX_FEEDBACK_HOST || "";
 if (managedSession && feedbackHost) throw new Error("A managed session must have one feedback owner; remove PSBX_FEEDBACK_HOST");
 if (feedbackHost && !["claude-code", "codex"].includes(feedbackHost)) throw new Error("PSBX_FEEDBACK_HOST must be claude-code or codex");
-const server = new Server({ name: "parallelsandbox", version: "0.6.0" }, {
+const server = new Server({ name: "parallelsandbox", version: "0.7.0" }, {
   capabilities: { tools: { listChanged: true }, ...(feedbackHost === "claude-code" ? CLAUDE_CHANNEL_CAPABILITIES : {}) },
   instructions: [connected ? remote.getInstructions() : "ParallelSandbox is signing in. Call parallelsandbox_connect to get the sign-in link or check completion. After sign-in, its sandbox_* and logs_* tools become available. Give every box a goal and finish with sandbox_review or sandbox_stop.", feedbackHost === "claude-code" ? CLAUDE_CHANNEL_INSTRUCTIONS : "", !managedSession && !feedbackHost ? setupInstructions() : ""].filter(Boolean).join("\n\n"),
 });
@@ -1918,8 +1943,12 @@ server.oninitialized = () => {
     claudeChannel?.startHandshake().catch((err) => log("channel:", err?.message || err));
     Promise.resolve(codexFeedback?.start()).catch((err) => log("feedback:", err?.message || err));
     if (feedbackRoute) {
-      // A relay that crashed while this host stays open comes back within a minute.
-      const resume = () => feedbackRoute.resumeRelay().catch((err) => log("feedback relay:", err?.message || err));
+      // A relay that crashed while this host stays open comes back within a minute, and this conversation's
+      // presence file is rewritten for it (the relay drops one that went quiet).
+      const resume = () => {
+        feedbackRoute.resumeRelay().catch((err) => log("feedback relay:", err?.message || err));
+        if (presenceStarted) refreshPresence();
+      };
       resume();
       setInterval(resume, 60_000).unref();
     }
