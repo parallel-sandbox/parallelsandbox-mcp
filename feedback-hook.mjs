@@ -8,7 +8,7 @@
 // Cursor and Gemini have no idle wake: their end-of-turn hook holds for a bounded time right
 // after a review was requested, and otherwise hands over waiting feedback at the next turn end.
 import { execFile } from "node:child_process";
-import { readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { alive, attachReview, attachSiblings, parentOf, defaultFeedbackDir, isDesignVersion, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, takeMail, ticketKey, waiterPidFile } from "./feedback-relay.mjs";
@@ -140,13 +140,31 @@ export function isClaudeCodeHook(raw, env = process.env) {
     && typeof raw.transcript_path === "string" && basename(raw.transcript_path) === `${raw.session_id}.jsonl`;
 }
 
-export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = process.env, foreground = hostRunsHookInForeground, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s) }) {
+// The hook never fails its host, so whatever keeps a review from its conversation is written here
+// (<feedback dir>/run/hook.log) instead of disappearing with the hook's exit code 0.
+export function hookLog(dir, line) {
+  try { appendFileSync(join(privateDir(paths(dir).run), "hook.log"), `${new Date().toISOString()} pid=${process.pid} ${line}\n`, { mode: 0o600 }); }
+  catch { /* Logging must not break the host either. */ }
+}
+
+// The host's JSON arrives on stdin, read as a stream until it closes. index.mjs loads the MCP SDK before
+// it dispatches `hook`, which leaves fd 0 non-blocking: readFileSync(0) then throws EAGAIN as soon as a
+// large result (a draft's pictures) outruns the host's writes, and that review was never attached.
+export async function readHookInput(stream = process.stdin) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = process.env, foreground = hostRunsHookInForeground, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), log = (line) => hookLog(dir, line) }) {
   if (host === "claude-code" && !isClaudeCodeHook(raw, env)) return 0;
   const input = hookInput(host, raw);
   if (typeof input.session !== "string" || !input.session) return 0;
   const event = raw.hook_event_name || "";
   const holdMs = Number(env.PSBX_HOOK_HOLD_SEC || 1200) * 1000;
-  if (input.tool) attachFromTool({ dir, host, input });
+  if (input.tool && !attachFromTool({ dir, host, input }) && REVIEW_TOOL.test(input.tool) && reviewFromResult(input.result)) {
+    log(`${host} ${input.tool} review ${reviewFromResult(input.result)} was not attached to session ${input.session} (no ticket, expired, or another conversation's)`);
+  }
   attachSiblings({ dir, host, session: input.session });
 
   if (host === "claude-code") {
@@ -185,7 +203,8 @@ export async function hookMain(argv = process.argv.slice(2)) {
   const host = i >= 0 ? argv[i + 1] : "";
   if (!["claude-code", "cursor", "gemini"].includes(host)) { process.stderr.write("hook --host <claude-code|cursor|gemini>\n"); return 0; }
   let raw = {};
-  try { raw = JSON.parse(readFileSync(0, "utf8") || "{}"); } catch { /* Never break the host over a malformed input. */ }
+  try { raw = JSON.parse((await readHookInput()) || "{}"); }
+  catch (e) { hookLog(defaultFeedbackDir(), `${host} hook input unreadable: ${e?.code || e?.message || e}`); } // Never break the host over a malformed input.
   try { return await runHook({ host, raw }); }
   catch (e) { process.stderr.write(`parallelsandbox hook: ${e?.message || e}\n`); if (host !== "claude-code") process.stdout.write("{}"); return 0; }
 }

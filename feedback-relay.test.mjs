@@ -4,6 +4,7 @@ import { once as onceEvent } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, credentialKey, followUpText, hostCodexCli, mailFor, paths, presenceFile, PRESENCE_STALE_MS, readJson, relayFeaturesFile, runRelay, takeMail, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
 import { foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
@@ -453,6 +454,41 @@ test("a drawn design version attaches the conversation the same way a review doe
   // A review card still needs its box.
   await route(dir).trackReview({ boxId: "box-1", reviewId: "rev-card", clientName: "cursor-vscode" });
   assert.equal(attachFromTool({ dir, host: "cursor", input: { session: "s1", tool: "mcp__parallelsandbox__sandbox_review", input: {}, result: { content: [{ type: "text", text: JSON.stringify({ ok: true, reviewId: "rev-card" }) }] } } }), false);
+});
+
+// 10/27 草稿回饋沒回到原對話：草稿結果帶圖、約 1 MB，Claude Code 分段寫進 hook 的 stdin；hook 從 index.mjs 進來時
+// fd 0 已被 MCP SDK 改成非阻塞，readFileSync(0) 一讀到空檔就 EAGAIN，hook 把它當空輸入、exit 0，這一版就沒綁上。
+test("a draft result too large for one pipe write still attaches through the real hook entry", async (t) => {
+  const dir = tmp();
+  await route(dir).trackReview({ reviewId: "dsn_abc123", clientName: "claude-code" });
+  const child = spawn(process.execPath, [fileURLToPath(new URL("./index.mjs", import.meta.url)), "hook", "--host", "claude-code"], {
+    env: { ...process.env, PSBX_FEEDBACK_DIR: dir, CLAUDE_CODE_SESSION_ID: "S1", CLAUDE_PID: "" }, stdio: ["pipe", "ignore", "ignore"] });
+  t.after(() => child.kill());
+  const picture = { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "A".repeat(2_000_000) } };
+  const input = Buffer.from(JSON.stringify({ session_id: "S1", hook_event_name: "PostToolUse", tool_name: "mcp__parallelsandbox__sandbox_draft", tool_input: { topic: "checkout" },
+    tool_response: [{ type: "text", text: JSON.stringify(DESIGN) }, picture] }));
+  // The host writes in pieces and pauses between them, as it does under load.
+  for (let at = 0; at < input.length; at += 200_000) {
+    child.stdin.write(input.subarray(at, at + 200_000));
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  child.stdin.end();
+  const attached = join(paths(dir).attach, `${ticketKey(undefined, "dsn_abc123")}.json`);
+  for (let i = 0; i < 100 && !existsSync(attached); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(existsSync(attached), "the draft is attached to the conversation that drew it");
+  assert.equal(readJson(attached).session, "S1");
+});
+
+test("an unreadable hook input and a review the hook cannot attach are logged, not lost", async () => {
+  const { hookLog } = await import("./feedback-hook.mjs");
+  const dir = tmp();
+  hookLog(dir, "claude-code hook input unreadable: EAGAIN");
+  const lines = [];
+  await runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "S1" }, log: (l) => lines.push(l),
+    raw: { session_id: "S1", tool_name: "mcp__parallelsandbox__sandbox_draft", tool_response: designResult().content } });
+  assert.match(readFileSync(join(paths(dir).run, "hook.log"), "utf8"), /hook input unreadable: EAGAIN/);
+  assert.equal(lines.length, 1, "no ticket was written for this design version");
+  assert.match(lines[0], /dsn_abc123 was not attached to session S1/);
 });
 
 test("design feedback without a box: binds without boxId, wakes with the design text, and reading by reportId acknowledges read", async () => {
