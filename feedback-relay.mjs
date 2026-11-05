@@ -21,10 +21,11 @@
 // with 62 reviewed conversations in the last 7 days sent 1,200 requests a minute, 98% of its traffic, and used up the
 // rate limit that every conversation on that machine shared. An older server without these routes still works:
 // one 25-second poll per conversation, one heartbeat per adapter.
-// Credentials stay in the adapter and relay environments; state files hold ids only.
+// Credentials stay in the adapter and relay environments; state files hold ids only. The relay reads a state directory
+// again only when it changed, and drops a delivery's journal and mail with its report, after 7 days.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +78,36 @@ const list = (dir) => orNull(() => readdirSync(dir)) || [];
 const ticketNames = (dir) => list(dir).filter((n) => n.endsWith(".json"));
 // One unreadable ticket must never stop the others from being considered.
 const ticketOrNull = (path) => { try { return readJson(path); } catch { return null; } };
+// The JSON files of one state directory, read again only where they changed. Every writer replaces a file by rename
+// (writeJson) or creates one, and either moves the directory's mtime: while it stays put, a round costs one lstat.
+// Reading all of them every round (295 tickets, 298 attach files and 283 journal entries on a Mac, 11/5) cost 4–10 ms
+// of CPU a round, every second; now an unchanged round costs about 0.3 ms.
+// A change in the same clock tick as a read can leave the mtime as it was (filesystems keep it to 2 s at worst), and a
+// file written in place can be read half-written: until both have passed, the directory is listed again every round,
+// and only the files whose stat changed are read.
+const DIR_SETTLE_MS = 2000;
+function jsonFiles(dir) {
+  const files = new Map(); // name -> { st, value } or { st, error }
+  let settled = null; // the directory's mtime at the last read, once nothing in it was still changing
+  return () => {
+    const now = Date.now(), st = lstatSync(dir, { throwIfNoEntry: false });
+    if (st && st.mtimeMs === settled) return files;
+    const names = new Set(st ? ticketNames(dir) : []);
+    let complete = !!st;
+    for (const name of files.keys()) if (!names.has(name)) files.delete(name);
+    for (const name of names) {
+      const path = join(dir, name), fst = lstatSync(path, { throwIfNoEntry: false }), prev = files.get(name);
+      if (!fst) { files.delete(name); continue; }
+      if (!prev || prev.st.mtimeMs !== fst.mtimeMs || prev.st.size !== fst.size || prev.st.ino !== fst.ino) {
+        try { files.set(name, { st: fst, value: readJson(path) }); }
+        catch (err) { if (err.code === "ENOENT") { files.delete(name); continue; } files.set(name, { st: fst, error: err }); }
+      }
+      if (files.get(name).error) complete = false;
+    }
+    settled = complete && now - st.mtimeMs >= DIR_SETTLE_MS ? st.mtimeMs : null;
+    return files;
+  };
+}
 export function alive(pid) { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; } }
 export const paths = (dir) => ({ dir, tickets: join(dir, "tickets"), attach: join(dir, "attach"), journal: join(dir, "journal"), mail: join(dir, "mail"), run: join(dir, "run"), presence: join(dir, "presence") });
 export const presenceFile = (dir, agentId) => join(paths(dir).presence, `${sha("presence", agentId).slice(0, 40)}.json`);
@@ -299,7 +330,15 @@ export async function waiterRunning({ dir = defaultFeedbackDir(), host, session,
 }
 
 // ---------- relay ----------
-const sleep = (ms, signal) => new Promise((r) => { const t = setTimeout(r, ms); signal?.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true }); });
+// The abort listener goes when the timer fires. The relay sleeps on its own lifetime signal every round, and the
+// listener left on it each time kept its Timeout, Promise and closures, 525 bytes a round (heap snapshots, 11/5):
+// 45 MB of live heap a day, and a relay on a Mac at 3.5 GB after 9 days.
+export const sleep = (ms, signal) => new Promise((done) => {
+  if (signal?.aborted) return done();
+  const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); done(); };
+  const timer = setTimeout(finish, ms);
+  signal?.addEventListener("abort", finish, { once: true });
+});
 
 // A ticket the server refuses to bind is set aside until its file changes; a failure that may pass
 // (network, timeout, 401/408/425/429, 5xx) is retried after 30 s, doubling up to 10 minutes.
@@ -319,9 +358,11 @@ const HOST_CHECK_MS = 5000;
 const missingRoute = (status) => status === 404 || status === 405;
 const chunks = (list, n) => { const out = []; for (let i = 0; i < list.length; i += n) out.push(list.slice(i, i + n)); return out; };
 
-export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, hostGraceMs = HOST_GRACE_MS, heartbeatMs = HEARTBEAT_MS, waiting = waiterRunning, signal, print = console.log }) {
+// keepMs: how long a delivery's journal and mail, and an attach file whose ticket is gone, are kept (reports are kept 7 days).
+export async function runRelay({ dir, credKey, env = process.env, fetchImpl, queue = codexQueue, once = false, idleExitMs = 60_000, scanMs = 1000, claimWaitSec = 25, bindRetryMs = BIND_RETRY_MS, bindRetryMaxMs = BIND_RETRY_MAX_MS, hostGraceMs = HOST_GRACE_MS, heartbeatMs = HEARTBEAT_MS, keepMs = TICKET_LIFETIME_MS, waiting = waiterRunning, signal, print = console.log }) {
   const p = paths(dir);
   privateDir(p.run); privateDir(p.journal); privateDir(p.mail);
+  const attachFiles = jsonFiles(p.attach), ticketFiles = jsonFiles(p.tickets), journalFiles = jsonFiles(p.journal);
   const pidFile = join(p.run, `relay-${credKey}.pid`);
   const featuresFile = relayFeaturesFile(dir, credKey);
   const say = (...a) => print(stamp(), ...a);
@@ -332,7 +373,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
   const controller = new AbortController();
   if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener("abort", () => controller.abort(), { once: true }); }
   const consumers = new Map(); // consumerId -> { id, agentId, ticket, target }: every conversation the one claim asks for
-  const bound = new Set(); // consumerId/ticket
+  const bound = new Map(); // ticket key -> the consumerId it was bound to
   const gone = new Set(); // consumers the server no longer has for their agent: never asked again by this relay
   const legacy = new Map(); // consumerId -> its own poll, only against a server without the batch claim
   // Tickets that could not be bound or read, by ticket key: { sig, message, retryAt, delay }.
@@ -347,20 +388,36 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
       }
       return fetcher;
     };
-    // One POST to the control API; `wake` cuts a long poll short when the set of conversations changed.
+    // One POST to the control API; `wake` cuts a long poll short when the set of conversations changed. The request has
+    // its own AbortController, which follows the relay's lifetime and the wake only while the request runs: an
+    // AbortSignal.any of them kept up to 390 bytes per request (Node 20–25) after the request and its timeout were over (11/5).
     const call = async ({ apiUrl, mcpUrl }, agentId, path, body, wake) => {
       const f = await fetcherFor(mcpUrl);
-      const signals = [controller.signal, AbortSignal.timeout(40_000), ...(wake ? [wake] : [])];
-      const res = await f(`${apiUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...(agentId ? { "X-Psbx-Agent": agentId } : {}), "X-Psbx-Client": "parallelsandbox-feedback-relay" }, body: JSON.stringify(body), signal: AbortSignal.any(signals) });
-      const data = res.status === 204 ? {} : await res.json().catch(() => ({}));
-      if (!res.ok) { const err = new Error(data.error || `HTTP ${res.status}`); err.status = res.status; throw err; }
-      return data;
+      const request = new AbortController(), follow = [controller.signal, ...(wake ? [wake] : [])], abort = () => request.abort();
+      const timer = setTimeout(() => request.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), 40_000);
+      for (const s of follow) { if (s.aborted) request.abort(); else s.addEventListener("abort", abort, { once: true }); }
+      try {
+        const res = await f(`${apiUrl}${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...(agentId ? { "X-Psbx-Agent": agentId } : {}), "X-Psbx-Client": "parallelsandbox-feedback-relay" }, body: JSON.stringify(body), signal: request.signal });
+        const data = res.status === 204 ? {} : await res.json().catch(() => ({}));
+        if (!res.ok) { const err = new Error(data.error || `HTTP ${res.status}`); err.status = res.status; throw err; }
+        return data;
+      } finally {
+        clearTimeout(timer);
+        for (const s of follow) s.removeEventListener("abort", abort);
+      }
     };
     const request = (ticket, agentId, path, body) => call(ticket, agentId, `/v1/feedback-consumers${path}`, body);
-    const targetOf = (ticket, key) => {
+    const targetOf = (ticket, a) => {
       if (ticket.codex) return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
-      const a = ticketOrNull(join(p.attach, `${key}.json`));
       return a ? { kind: "hook", host: a.host, id: a.session } : null;
+    };
+    // Where a ticket's feedback goes, worked out again only when its ticket or attach file changed.
+    const routeOf = (file, attach) => {
+      if (!file.route || file.route.attach !== attach) {
+        const target = targetOf(file.value, attach?.value);
+        file.route = { attach, target, consumerId: target && `fr_${sha("consumer", file.value.agentId, target.host, target.id).slice(0, 40)}` };
+      }
+      return file.route;
     };
     const deliver = async (consumer, event) => {
       const jpath = join(p.journal, `${sha(consumer.id, event.eventId).slice(0, 40)}.json`);
@@ -417,12 +474,24 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
     // that does not take one is reported. One pass over the journal for every conversation, from the scan loop:
     // local files only, and a request only when something changed (a failed one backs off per event).
     const retryAt = new Map(); // eventId -> { at, delay }
+    // A delivery is kept as long as its report: its journal, its mail with the handed marker, and the conversation's
+    // mailbox once that is empty, go 7 days after the follow-up was mailed (or the journal last changed).
+    const dropDelivery = (jpath, j) => {
+      if (j?.eventId) {
+        const box = join(p.mail, sessionKey(j.host, j.target));
+        orNull(() => unlinkSync(join(box, `${j.eventId}.json`)));
+        orNull(() => unlinkSync(join(box, `${j.eventId}.handed`)));
+        try { rmdirSync(box); } catch { /* other follow-ups are still there, or there never was a mailbox (Codex) */ }
+        retryAt.delete(j.eventId); hostChecked.delete(j.eventId);
+      }
+      orNull(() => unlinkSync(jpath));
+    };
     const settle = async () => {
       let firstError = null;
-      for (const name of list(p.journal)) {
+      for (const [name, file] of journalFiles()) {
         if (controller.signal.aborted) break;
-        const jpath = join(p.journal, name);
-        const j = orNull(() => readJson(jpath));
+        const jpath = join(p.journal, name), j = file.value;
+        if (Date.now() - (j?.mailedAt || file.st.mtimeMs) > keepMs) { dropDelivery(jpath, j); continue; }
         if (!j || j.state !== "mailed") continue;
         const consumer = consumers.get(j.consumerId);
         if (!consumer) continue;
@@ -479,6 +548,8 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
     };
     const claimLoop = async () => {
       let backoff = 1000;
+      // Stopping the relay also ends the wait between two claims, through that round's wake.
+      controller.signal.addEventListener("abort", () => claimWake?.abort(), { once: true });
       while (!controller.signal.aborted && batch) {
         const wake = new AbortController();
         claimWake = wake;
@@ -488,7 +559,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
           backoff = 1000;
           if (!batch) break;
           // Nothing to ask for, or a server that answered at once: wait a moment (a new conversation wakes it).
-          if (!events && !wake.signal.aborted && Date.now() - started < 1000) await sleep(Math.max(scanMs, 1000), AbortSignal.any([controller.signal, wake.signal]));
+          if (!events && !wake.signal.aborted && Date.now() - started < 1000) await sleep(Math.max(scanMs, 1000), wake.signal);
         } catch (err) {
           if (controller.signal.aborted) return;
           say("delivery pending:", err.message);
@@ -574,28 +645,23 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
     const scan = async () => {
       let active = 0, firstError = null, changed = false;
       const seen = new Set(), wanted = new Set();
-      for (const name of ticketNames(p.tickets)) {
+      // Attach files first: a ticket is written before its attach file, so every attach file read here has its ticket below.
+      const attached = attachFiles(), tickets = ticketFiles();
+      for (const [name, file] of tickets) {
         if (controller.signal.aborted) break;
         const key = name.slice(0, -".json".length), path = join(p.tickets, name);
         seen.add(key);
-        const st = (() => { try { return lstatSync(path); } catch { return null; } })();
-        if (!st) continue;
-        let ticket;
-        try { ticket = readJson(path); }
-        catch (err) {
-          if (err.code !== "ENOENT") setTicketAside(key, `file:${st.mtimeMs}:${st.size}`, err, `cannot read ticket ${key}:`, false);
-          continue;
-        }
+        if (file.error) { setTicketAside(key, `file:${file.st.mtimeMs}:${file.st.size}`, file.error, `cannot read ticket ${key}:`, false); continue; }
+        const ticket = file.value;
+        // An expired ticket is nobody's: whichever relay meets it removes it, also one of another credential.
+        if (Date.now() > ticket?.expiresAt) { orNull(() => unlinkSync(path)); orNull(() => unlinkSync(join(p.attach, name))); setAside.delete(key); continue; }
         if (!ticket || ticket.credKey !== credKey) continue;
-        if (Date.now() > ticket.expiresAt) { orNull(() => unlinkSync(path)); orNull(() => unlinkSync(join(p.attach, name))); setAside.delete(key); continue; }
         active++;
-        const target = targetOf(ticket, key);
+        const { target, consumerId } = routeOf(file, ticket.codex ? undefined : attached.get(name));
         if (!target) continue;
-        const consumerId = `fr_${sha("consumer", ticket.agentId, target.host, target.id).slice(0, 40)}`;
         if (gone.has(consumerId)) continue;
-        const bindKey = `${consumerId}/${key}`;
-        if (!bound.has(bindKey)) {
-          const sig = sha(JSON.stringify(ticket), target.host, target.id, st.mtimeMs);
+        if (bound.get(key) !== consumerId) {
+          const sig = sha(JSON.stringify(ticket), target.host, target.id, file.st.mtimeMs);
           const prev = setAside.get(key);
           if (prev && prev.sig === sig && Date.now() < prev.retryAt) continue;
           try {
@@ -607,7 +673,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
             continue;
           }
           setAside.delete(key);
-          bound.add(bindKey);
+          bound.set(key, consumerId);
           lastWork = Date.now();
           say("bound review", ticket.reviewId, "to", target.host, target.id);
         }
@@ -615,6 +681,9 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         if (!consumers.has(consumerId)) { consumers.set(consumerId, { id: consumerId, agentId: ticket.agentId, ticket, target }); changed = true; }
       }
       for (const key of setAside.keys()) if (!seen.has(key)) setAside.delete(key);
+      for (const key of bound.keys()) if (!seen.has(key)) bound.delete(key);
+      // An attach file outlives its ticket only when a relay stopped between removing the two.
+      for (const [name, a] of attached) if (!tickets.has(name) && Date.now() - a.st.mtimeMs > keepMs) orNull(() => unlinkSync(join(p.attach, name)));
       if (!controller.signal.aborted) for (const id of consumers.keys()) if (!wanted.has(id)) { consumers.delete(id); changed = true; }
       return { active, firstError, changed };
     };

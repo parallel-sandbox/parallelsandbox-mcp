@@ -3,6 +3,8 @@
 //                wakes the idle conversation by exiting 2 with the follow-up on stderr.
 //                `claude -p "<prompt>"` runs the same hook in the foreground instead: the tool
 //                result waits for it, so there only a fresh review waits for the person.
+//                Claude Desktop keeps feedback under its own conversation name, which a rewind does
+//                not change (see desktopConversation).
 //   cursor       afterMCPExecution attaches the review; stop returns {followup_message}.
 //   gemini       AfterTool attaches the review; AfterAgent returns {decision:"block", reason}.
 // Cursor and Gemini have no idle wake: their end-of-turn hook holds for a bounded time right
@@ -11,7 +13,7 @@ import { execFile } from "node:child_process";
 import { appendFileSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
-import { alive, attachReview, attachSiblings, parentOf, defaultFeedbackDir, isDesignVersion, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, takeMail, ticketKey, waiterPidFile } from "./feedback-relay.mjs";
+import { alive, attachReview, attachSiblings, parentOf, defaultFeedbackDir, isDesignVersion, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, takeMail, ticketKey, waiterPidFile, waiterRunning } from "./feedback-relay.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const REVIEW_TOOL = /sandbox_(review|draft|architecture|schema)$/;
@@ -84,11 +86,11 @@ function markDelivered(dir, mail) {
 // Hooks may run under an intermediate shell, so the parent and grandparent are both checked.
 export const hostGone = (ancestors) => ancestors.length > 0 && (process.ppid !== ancestors[0] || ancestors.some((pid) => !alive(pid)));
 
-async function waitForMail({ dir, host, session, until, by, ancestors = [] }) {
+async function waitForMail({ dir, host, session, also = [], until, by, ancestors = [] }) {
   for (;;) {
     if (hostGone(ancestors)) return null;
     attachSiblings({ dir, host, session });
-    for (const entry of mailFor({ dir, host, session })) {
+    for (const entry of [session, ...also].flatMap((s) => mailFor({ dir, host, session: s }))) {
       if (takeMail(entry, by)) { markDelivered(dir, entry.mail); return entry.mail; }
     }
     if (Date.now() >= until) return null;
@@ -140,6 +142,19 @@ export function isClaudeCodeHook(raw, env = process.env) {
     && typeof raw.transcript_path === "string" && basename(raw.transcript_path) === `${raw.session_id}.jsonl`;
 }
 
+// Claude Desktop names each conversation in CLAUDE_CODE_HOST_SESSION_ID (local_…), and the name outlives the CLI's
+// session id: a rewind stops the CLI, and the next message starts it with --resume --fork-session, a new session id in
+// the same conversation (SessionStart source "fork", Claude Code 2.1.309). Feedback kept under the old id never reached
+// it (11/2). A `claude` started by a tool in that conversation inherits the variable, so the name counts only for the
+// CLI the app itself launched: CLAUDE_PID's parent is inside Claude.app. Anything else keeps its own session id.
+const DESKTOP_APP = /\/Claude[^/]*\.app\/Contents\//;
+export async function desktopConversation({ env = process.env, ps = parentOf } = {}) {
+  const name = env.CLAUDE_CODE_HOST_SESSION_ID, cli = Number(env.CLAUDE_PID);
+  if (!name || !(cli > 1)) return "";
+  const parent = await ps(cli).then((c) => c && ps(c.ppid)).catch(() => null);
+  return parent && DESKTOP_APP.test(parent.exe) ? name : "";
+}
+
 // The hook never fails its host, so whatever keeps a review from its conversation is written here
 // (<feedback dir>/run/hook.log) instead of disappearing with the hook's exit code 0.
 export function hookLog(dir, line) {
@@ -156,10 +171,12 @@ export async function readHookInput(stream = process.stdin) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = process.env, foreground = hostRunsHookInForeground, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), log = (line) => hookLog(dir, line) }) {
+export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = process.env, foreground = hostRunsHookInForeground, conversation = desktopConversation, out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), log = (line) => hookLog(dir, line) }) {
   if (host === "claude-code" && !isClaudeCodeHook(raw, env)) return 0;
   const input = hookInput(host, raw);
   if (typeof input.session !== "string" || !input.session) return 0;
+  const cliSession = input.session;
+  if (host === "claude-code") input.session = (await conversation({ env })) || cliSession;
   const event = raw.hook_event_name || "";
   const holdMs = Number(env.PSBX_HOOK_HOLD_SEC || 1200) * 1000;
   if (input.tool && !attachFromTool({ dir, host, input }) && REVIEW_TOOL.test(input.tool) && reviewFromResult(input.result)) {
@@ -169,7 +186,9 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
 
   if (host === "claude-code") {
     // One background waiter per conversation; the next one starts at the next review/report call.
-    if (!sessionExpectsFeedback({ dir, host, session: input.session })) return 0;
+    // Reviews attached under the CLI session id before 0.7.2 still expire within 7 days: keep watching them.
+    const also = input.session === cliSession ? [] : [cliSession];
+    if (![input.session, ...also].some((session) => sessionExpectsFeedback({ dir, host, session }))) return 0;
     // In the foreground only a review still open for the person waits. Waiting after sandbox_report, at
     // SessionStart or after a review that returned its report would hold that report from the conversation
     // until the next one came: hand over a follow-up already waiting and return.
@@ -178,10 +197,11 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
     privateDir(paths(dir).run);
     const lock = waiterPidFile(dir, host, input.session);
     const holder = Number(orNull(() => readFileSync(lock, "utf8")) || 0);
-    if (holder && holder !== process.pid && alive(holder)) return 0;
+    // A waiter killed with its CLI leaves this file behind, and its pid may belong to another program by now.
+    if (holder && holder !== process.pid && await waiterRunning({ dir, host, session: input.session })) return 0;
     writeFileSync(lock, String(process.pid), { mode: 0o600 });
     try {
-      const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + waitMs, by: `claude:${process.pid}`, ancestors: await hostAncestors() });
+      const mail = await waitForMail({ dir, host, session: input.session, also, until: Date.now() + waitMs, by: `claude:${process.pid}`, ancestors: await hostAncestors() });
       if (!mail) return 0;
       err(mail.text + "\n");
       return 2; // asyncRewake: wakes the idle conversation, or queues behind the running turn.

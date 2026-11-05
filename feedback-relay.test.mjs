@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { once as onceEvent } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { getEventListeners, once as onceEvent } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, credentialKey, followUpText, hostCodexCli, mailFor, paths, presenceFile, PRESENCE_STALE_MS, readJson, relayFeaturesFile, runRelay, takeMail, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
-import { foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
+import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, credentialKey, followUpText, hostCodexCli, mailFor, paths, presenceFile, PRESENCE_STALE_MS, readJson, relayFeaturesFile, runRelay, sessionKey, sleep, takeMail, TICKET_LIFETIME_MS, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
+import { desktopConversation, foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
 import { hooksInstalled, hostConfig, hostFromClient, install, installNote, mergeHooks, reviewInstallNote, selfCommand, setupInstructions } from "./feedback-install.mjs";
 
 const T = "01a0f429-b209-77a2-b784-f314221e0c91";
@@ -348,6 +348,80 @@ test("claude -p runs the hook in the foreground: only an open review waits, sand
   const answered = { ...review, tool_response: [{ type: "text", text: JSON.stringify({ reviewId: REV, outcome: "report", reportId: RID }) }] };
   assert.equal(await runHook({ host: "claude-code", dir, env, foreground: fg, raw: answered }), 0);
   assert.ok(Date.now() - started < 1500);
+});
+
+// 11/2：審查等回饋時 Run 在桌面版 rewind（CLI 被停掉），之後送回饋、回對話傳訊息。桌面版用 --resume --fork-session 重開，
+// CLI session id 換了，回饋留在舊 id 的信箱，對話一直沒收到。回饋改跟著桌面版的對話名稱（local_…）走。
+const desktopTree = {
+  100: { ppid: 50, exe: "/Users/u/Library/Application Support/Claude/claude-code/2.1.309/abc/claude.app/Contents/MacOS/claude" },
+  50: { ppid: 40, exe: "/Applications/Claude.app/Contents/Helpers/disclaimer" },
+  200: { ppid: 150, exe: "/Users/u/.local/bin/claude" },
+  150: { ppid: 100, exe: "/bin/zsh" },
+};
+const desktopEnv = (session, name = "local_A", pid = "100") => ({ CLAUDE_CODE_SESSION_ID: session, CLAUDE_CODE_HOST_SESSION_ID: name, CLAUDE_PID: pid });
+const inDesktop = ({ env }) => desktopConversation({ env, ps: async (pid) => desktopTree[pid] || null });
+
+test("the Desktop conversation name counts only for the CLI the app itself launched", async () => {
+  const ps = async (pid) => desktopTree[pid] || null;
+  assert.equal(await desktopConversation({ env: desktopEnv("S1"), ps }), "local_A");
+  assert.equal(await desktopConversation({ env: desktopEnv("N1", "local_A", "200"), ps }), "", "a claude started by a tool inherits the variable");
+  assert.equal(await desktopConversation({ env: { CLAUDE_CODE_SESSION_ID: "S1", CLAUDE_PID: "100" }, ps }), "", "not Claude Desktop");
+  assert.equal(await desktopConversation({ env: { CLAUDE_CODE_HOST_SESSION_ID: "local_A" }, ps }), "", "no CLAUDE_PID");
+  assert.equal(await desktopConversation({ env: desktopEnv("S1"), ps: async () => { throw new Error("ps failed"); } }), "");
+  assert.equal(await desktopConversation({ env: desktopEnv("S1"), ps: async () => null }), "", "Windows has no process tree here");
+  assert.equal(await desktopConversation({ env: desktopEnv("S1"), ps: async (pid) => (pid === 100 ? { ppid: 50, exe: "/x/claude" } : { ppid: 1, exe: "/Users/u/Library/Application Support/Claude-c/claude-code/2.1.309/abc/claude.app/Contents/MacOS/claude" }) }), "", "the CLI's own claude.app is not the desktop app");
+});
+
+test("Claude Desktop: a rewound conversation takes its feedback after the app restarts it under a new session id", async () => {
+  const dir = tmp();
+  const BOX = "8yaqe15hjolv", REVIEW = "38b4697d3578a1b0a965"; // the 11/2 review
+  await route(dir).trackReview({ boxId: BOX, reviewId: REVIEW, clientName: "claude-code" });
+  // The review's hook in CLI session S1. (Desktop runs it in the background; in the foreground this result returns at once.)
+  const review = { hook_event_name: "PostToolUse", session_id: "S1", tool_name: "mcp__parallelsandbox__sandbox_review", tool_input: { id: BOX }, tool_response: [{ type: "text", text: JSON.stringify({ reviewId: REVIEW, outcome: "report", reportId: "earlier" }) }] };
+  assert.equal(await runHook({ host: "claude-code", dir, env: desktopEnv("S1"), conversation: inDesktop, foreground: async () => true, raw: review }), 0);
+  assert.equal(readJson(join(paths(dir).attach, `${ticketKey(BOX, REVIEW)}.json`)).session, "local_A");
+
+  // The rewind stopped the CLI and its waiter; the person sends feedback meanwhile.
+  const be = backend([{ boxId: BOX, reviewId: REVIEW, reportId: RID }]);
+  const relay = () => runRelay({ dir, credKey: credOf(dir, BOX, REVIEW), fetchImpl: be.fetchImpl, once: true, hostGraceMs: 0, print: () => {} });
+  await relay();
+  assert.deepEqual(be.host.map(([report, state]) => [report, state]), [[RID, "host_inactive"]]);
+  assert.equal(mailFor({ dir, host: "claude-code", session: "local_A" }).length, 1);
+
+  // Neither a claude started by a tool nor another Desktop conversation forked from this one takes it.
+  const start = (session, env, source = "fork") => { let text = ""; return runHook({ host: "claude-code", dir, env, conversation: inDesktop, foreground: async () => false, raw: { hook_event_name: "SessionStart", source, session_id: session }, err: (s) => { text += s; } }).then((code) => ({ code, text })); };
+  assert.equal((await start("N1", desktopEnv("N1", "local_A", "200"), "startup")).code, 0);
+  assert.equal((await start("B1", desktopEnv("B1", "local_B"))).code, 0);
+  assert.equal(mailFor({ dir, host: "claude-code", session: "local_A" }).length, 1, "still waiting for its own conversation");
+
+  // The person sends the conversation a message: --resume --fork-session, same Desktop name, new session id.
+  const forked = await start("S2", desktopEnv("S2"));
+  assert.equal(forked.code, 2);
+  assert.match(forked.text, new RegExp(`sandbox_report tool with exactly .*${RID}`));
+  await relay();
+  assert.equal(be.acked.get(RID), "host_accepted");
+
+  // A later resume of this same review from the forked session is the same conversation, not "another conversation's".
+  const lines = [];
+  assert.equal(await runHook({ host: "claude-code", dir, env: desktopEnv("S2"), conversation: inDesktop, foreground: async () => true, log: (l) => lines.push(l), raw: { ...review, session_id: "S2" } }), 0);
+  assert.deepEqual(lines, []);
+});
+
+test("Claude Desktop: a review attached under the CLI session id before 0.7.2 still reaches that session", async () => {
+  const dir = await mailed("claude-code", "S1");
+  let err = "";
+  assert.equal(await runHook({ host: "claude-code", dir, env: desktopEnv("S1"), conversation: inDesktop, foreground: async () => false, raw: { hook_event_name: "SessionStart", source: "resume", session_id: "S1" }, err: (s) => { err = s; } }), 2);
+  assert.match(err, /sandbox_report tool/);
+});
+
+test("a waiter pid left behind and reused by another program does not keep the next waiter from starting", async (t) => {
+  const dir = await mailed("claude-code", "S1");
+  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await onceEvent(other, "spawn");
+  mkdirSync(paths(dir).run, { recursive: true });
+  writeFileSync(waiterPidFile(dir, "claude-code", "S1"), String(other.pid));
+  assert.equal(await runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "S1" }, foreground: async () => false, raw: { hook_event_name: "SessionStart", session_id: "S1" }, err: () => {} }), 2);
 });
 
 test("a waiter whose host is gone takes nothing", async () => {
@@ -804,6 +878,94 @@ test("a relay stays up while a conversation on the machine is live, and says it 
   await until(() => finished);
   await running;
   assert.equal(existsSync(relayFeaturesFile(dir, credKey)), false);
+});
+
+// 11/5：relay 每輪都用自己的生命週期 signal 睡，計時器到期時 abort listener 沒拿掉，連同計時器和 promise 一起留著，9 天漲到 3.5 GB。
+test("a sleep that runs out leaves no listener on the signal that could have cut it short", async () => {
+  const lifetime = new AbortController();
+  for (let i = 0; i < 50; i++) await sleep(1, lifetime.signal);
+  assert.equal(getEventListeners(lifetime.signal, "abort").length, 0);
+  const cut = sleep(60_000, lifetime.signal);
+  assert.equal(getEventListeners(lifetime.signal, "abort").length, 1);
+  lifetime.abort();
+  await cut;
+  assert.equal(getEventListeners(lifetime.signal, "abort").length, 0);
+  const started = Date.now();
+  await sleep(60_000, lifetime.signal);
+  assert.ok(Date.now() - started < 1000, "an aborted signal does not wait at all");
+});
+
+// 11/5：relay 每秒把每張票、attach 檔、journal 都重讀重解析一次，Mac 上佔 30–40% 的核心。目錄沒變只 lstat 一次，
+// 變了也只讀 stat 變了的檔案；新的交件照樣馬上綁上。
+test("a running relay reads a state file again only when it changed, and still finds a new review at once", async () => {
+  const dir = tmp();
+  const reviews = await threeReviews(dir);
+  const p = paths(dir), past = Math.floor(Date.now() / 1000) - 60;
+  // Everything settled a minute ago, at a whole second, so a file's stat can be put back exactly.
+  for (const d of [p.tickets, p.attach]) { for (const n of readdirSync(d)) utimesSync(join(d, n), past, past); utimesSync(d, past, past); }
+  const be = backend([...reviews, "rev4"].map(reportFor));
+  const fetchImpl = async (url, init) => { if (url.endsWith("/claim")) await pause(10); return be.fetchImpl(url, init); };
+  const lines = [];
+  const stop = new AbortController();
+  const running = runRelay({ dir, credKey: credOf(dir), fetchImpl, scanMs: 5, signal: stop.signal, print: (...a) => lines.push(a.join(" ")) });
+  await until(() => reviews.every((_, i) => mailedTo(dir, i) === 1));
+  // Overwritten in place behind the relay's back, with the same size and mtime: a relay that read it again would say so.
+  const file = join(p.tickets, `${ticketKey("box1", "rev1")}.json`);
+  writeFileSync(file, "x".repeat(statSync(file).size));
+  utimesSync(file, past, past);
+  await pause(100);
+  // A new review changes the directory: it is bound and mailed, and the unchanged file is still not read.
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev4", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S4", boxId: "box1", reviewId: "rev4" });
+  await until(() => mailedTo(dir, 3) === 1);
+  stop.abort();
+  await running;
+  assert.deepEqual(lines.filter((l) => l.includes("cannot read ticket")), []);
+});
+
+// 11/5：journal、信件和 handed 標記從來不刪，Mac 上 34 天累積 283 筆 journal、98 個信箱。回報留 7 天，送達紀錄跟著留 7 天。
+test("a delivery goes with its report after 7 days, and so do stray attach files and expired tickets of any credential", async () => {
+  const dir = tmp();
+  for (const r of ["rev1", "rev2"]) {
+    await route(dir).trackReview({ boxId: "box1", reviewId: r, clientName: "claude-code" });
+    attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: r });
+  }
+  const be = backend(["rev1", "rev2"].map(reportFor));
+  const relay = () => runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, print: () => {} });
+  // One conversation, so one consumer: each claim hands out one of its two reports.
+  for (let i = 0; i < 6 && be.acked.size < 2; i++) {
+    await relay();
+    for (const entry of mailFor({ dir, host: "claude-code", session: "S1" })) takeMail(entry, "w");
+  }
+  assert.deepEqual([...be.acked.values()], ["host_accepted", "host_accepted"]);
+  const p = paths(dir), box = join(p.mail, sessionKey("claude-code", "S1")), DAY = 86_400_000;
+  const journalOf = (reportId) => readdirSync(p.journal).map((n) => join(p.journal, n)).find((f) => readJson(f).reportId === reportId);
+  const age = (file, ms) => { const t = (Date.now() - ms) / 1000; utimesSync(file, t, t); };
+  const mailedLongAgo = (reportId) => { const f = journalOf(reportId); writeJson(f, { ...readJson(f), mailedAt: Date.now() - TICKET_LIFETIME_MS - 1000 }); };
+  mailedLongAgo("rev1-report");
+  // An attach file a stopped relay left without its ticket, one just written, and an expired ticket of another credential.
+  const stray = join(p.attach, `${"0".repeat(40)}.json`), fresh = join(p.attach, `${"1".repeat(40)}.json`);
+  writeJson(stray, { host: "claude-code", session: "S9", at: Date.now() - 8 * DAY });
+  age(stray, 8 * DAY);
+  writeJson(fresh, { host: "claude-code", session: "S8", at: Date.now() });
+  const other = `${"2".repeat(40)}.json`;
+  writeJson(join(p.tickets, other), { boxId: "box1", reviewId: "old", agentId: "agentZ", credKey: "ffffffffffffffff", expiresAt: Date.now() - 1 });
+  writeJson(join(p.attach, other), { host: "claude-code", session: "S7", at: Date.now() - 8 * DAY });
+  const broken = join(p.journal, `${"3".repeat(40)}.json`);
+  writeFileSync(broken, "{");
+  age(broken, 8 * DAY);
+  await relay();
+  assert.equal(journalOf("rev1-report"), undefined);
+  assert.deepEqual(readdirSync(box).sort(), ["ev-rev2-report.handed", "ev-rev2-report.json"], "rev1's mail and handed marker went with its journal");
+  assert.equal(existsSync(stray), false);
+  assert.equal(existsSync(fresh), true, "an attach file without its ticket stays until it is 7 days old");
+  assert.deepEqual([existsSync(join(p.tickets, other)), existsSync(join(p.attach, other))], [false, false]);
+  assert.equal(existsSync(broken), false);
+  assert.equal(readdirSync(p.attach).filter((n) => n !== `${"1".repeat(40)}.json`).length, 2, "the live reviews keep their attach files");
+  mailedLongAgo("rev2-report");
+  await relay();
+  assert.deepEqual(readdirSync(p.journal), []);
+  assert.equal(existsSync(box), false, "an emptied mailbox goes too");
 });
 
 test("an adapter hands its heartbeat only to a relay that sends it", async () => {
