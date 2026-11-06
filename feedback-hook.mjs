@@ -13,7 +13,7 @@ import { execFile } from "node:child_process";
 import { appendFileSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
-import { alive, attachReview, attachSiblings, parentOf, defaultFeedbackDir, isDesignVersion, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, takeMail, ticketKey, waiterPidFile, waiterRunning } from "./feedback-relay.mjs";
+import { alive, attachReview, attachSiblings, parentOf, defaultFeedbackDir, dirWatch, isDesignVersion, mailFor, orNull, paths, privateDir, readJson, sessionExpectsFeedback, sessionKey, takeMail, ticketKey, waiterPidFile, waiterRunning } from "./feedback-relay.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const REVIEW_TOOL = /sandbox_(review|draft|architecture|schema)$/;
@@ -86,11 +86,16 @@ function markDelivered(dir, mail) {
 // Hooks may run under an intermediate shell, so the parent and grandparent are both checked.
 export const hostGone = (ancestors) => ancestors.length > 0 && (process.ppid !== ancestors[0] || ancestors.some((pid) => !alive(pid)));
 
+// A waiter polls every second for as long as its conversation lives, so it looks at the attach files and its mailbox
+// again only when their directories changed: reading every attach file each second, 22 waiters on a Mac took 38% of a
+// core (11/6).
 async function waitForMail({ dir, host, session, also = [], until, by, ancestors = [] }) {
+  const p = paths(dir), sessions = [session, ...also];
+  const reviewsChanged = dirWatch([p.attach, p.tickets]), mailChanged = dirWatch(sessions.map((s) => join(p.mail, sessionKey(host, s))));
   for (;;) {
     if (hostGone(ancestors)) return null;
-    attachSiblings({ dir, host, session });
-    for (const entry of [session, ...also].flatMap((s) => mailFor({ dir, host, session: s }))) {
+    if (reviewsChanged()) attachSiblings({ dir, host, session });
+    if (mailChanged()) for (const entry of sessions.flatMap((s) => mailFor({ dir, host, session: s }))) {
       if (takeMail(entry, by)) { markDelivered(dir, entry.mail); return entry.mail; }
     }
     if (Date.now() >= until) return null;

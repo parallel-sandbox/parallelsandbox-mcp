@@ -968,6 +968,34 @@ test("a delivery goes with its report after 7 days, and so do stray attach files
   assert.equal(existsSync(box), false, "an emptied mailbox goes too");
 });
 
+// 11/6：每個對話的 waiter 每秒把 attach 檔全部讀一遍，一台 Mac 22 支 waiter 合計佔 38% 的核心。目錄沒變就不再看；
+// 同一回合開的下一份交件、送來的回饋照樣馬上接到。
+test("a waiting hook looks at attach files and its mailbox again only when their directories change", async () => {
+  const dir = tmp(), p = paths(dir);
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S1", boxId: "box1", reviewId: "rev1" });
+  await route(dir, { agentId: "agentB" }).trackReview({ boxId: "box1", reviewId: "rev2", clientName: "claude-code" });
+  attachReview({ dir, host: "claude-code", session: "S2", boxId: "box1", reviewId: "rev2" });
+  const past = Math.floor(Date.now() / 1000) - 60;
+  for (const d of [p.tickets, p.attach]) { for (const n of readdirSync(d)) utimesSync(join(d, n), past, past); utimesSync(d, past, past); }
+  let err = "", ended = false;
+  const waiting = runHook({ host: "claude-code", dir, env: { CLAUDE_CODE_SESSION_ID: "S1" }, foreground: async () => false,
+    raw: { hook_event_name: "SessionStart", session_id: "S1" }, err: (s) => { err += s; } }).finally(() => { ended = true; });
+  await pause(500);
+  // Another conversation's attach file, overwritten in place behind the waiter's back: a waiter that read it would fail.
+  const other = join(p.attach, `${ticketKey("box1", "rev2")}.json`), original = readFileSync(other);
+  writeFileSync(other, "x".repeat(original.length));
+  await pause(2500);
+  assert.equal(ended, false, "the waiter did not read the attach files again");
+  writeFileSync(other, original);
+  // A second review this conversation's adapter opens is attached to it, and its feedback is handed over.
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev3", clientName: "claude-code" });
+  await until(() => existsSync(join(p.attach, `${ticketKey("box1", "rev3")}.json`)));
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: backend([reportFor("rev3")]).fetchImpl, once: true, print: () => {} });
+  assert.equal(await waiting, 2);
+  assert.match(err, /"reportId":"rev3-report"/);
+});
+
 test("an adapter hands its heartbeat only to a relay that sends it", async () => {
   const dir = tmp();
   mkdirSync(paths(dir).run, { recursive: true });

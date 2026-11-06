@@ -78,33 +78,41 @@ const list = (dir) => orNull(() => readdirSync(dir)) || [];
 const ticketNames = (dir) => list(dir).filter((n) => n.endsWith(".json"));
 // One unreadable ticket must never stop the others from being considered.
 const ticketOrNull = (path) => { try { return readJson(path); } catch { return null; } };
-// The JSON files of one state directory, read again only where they changed. Every writer replaces a file by rename
-// (writeJson) or creates one, and either moves the directory's mtime: while it stays put, a round costs one lstat.
-// Reading all of them every round (295 tickets, 298 attach files and 283 journal entries on a Mac, 11/5) cost 4–10 ms
-// of CPU a round, every second; now an unchanged round costs about 0.3 ms.
-// A change in the same clock tick as a read can leave the mtime as it was (filesystems keep it to 2 s at worst), and a
-// file written in place can be read half-written: until both have passed, the directory is listed again every round,
-// and only the files whose stat changed are read.
+// Whether any of these state directories changed since a look that found them settled. Every writer here creates,
+// renames (writeJson) or removes files, and each of those moves the directory's mtime; a missing directory is a state of
+// its own. A change in the same clock tick as a look can leave the mtime as it was (filesystems keep it to 2 s at worst),
+// so a directory changed within DIR_SETTLE_MS of a look counts as changed again at the next one.
 const DIR_SETTLE_MS = 2000;
-function jsonFiles(dir) {
-  const files = new Map(); // name -> { st, value } or { st, error }
-  let settled = null; // the directory's mtime at the last read, once nothing in it was still changing
+export function dirWatch(dirs) {
+  let settled = null;
   return () => {
-    const now = Date.now(), st = lstatSync(dir, { throwIfNoEntry: false });
-    if (st && st.mtimeMs === settled) return files;
-    const names = new Set(st ? ticketNames(dir) : []);
-    let complete = !!st;
+    const now = Date.now(), times = dirs.map((d) => lstatSync(d, { throwIfNoEntry: false })?.mtimeMs ?? -1), sig = times.join(" ");
+    if (sig === settled) return false;
+    settled = times.every((t) => t < 0 || now - t >= DIR_SETTLE_MS) ? sig : null;
+    return true;
+  };
+}
+// The JSON files of one state directory, read again only where they changed: while the directory stays put, a round
+// costs one lstat. Reading all of them every round (295 tickets, 298 attach files and 283 journal entries on a Mac, 11/5)
+// cost 4–10 ms of CPU a round, every second; now an unchanged round costs about 0.3 ms. A file that could not be read
+// (one written in place can be caught half-written) keeps the directory listed every round, and only files whose stat
+// changed are read.
+function jsonFiles(dir) {
+  const files = new Map(), changed = dirWatch([dir]); // name -> { st, value } or { st, error }
+  let unreadable = false;
+  return () => {
+    if (!changed() && !unreadable) return files;
+    const names = new Set(ticketNames(dir));
     for (const name of files.keys()) if (!names.has(name)) files.delete(name);
     for (const name of names) {
       const path = join(dir, name), fst = lstatSync(path, { throwIfNoEntry: false }), prev = files.get(name);
       if (!fst) { files.delete(name); continue; }
       if (!prev || prev.st.mtimeMs !== fst.mtimeMs || prev.st.size !== fst.size || prev.st.ino !== fst.ino) {
         try { files.set(name, { st: fst, value: readJson(path) }); }
-        catch (err) { if (err.code === "ENOENT") { files.delete(name); continue; } files.set(name, { st: fst, error: err }); }
+        catch (err) { if (err.code === "ENOENT") files.delete(name); else files.set(name, { st: fst, error: err }); }
       }
-      if (files.get(name).error) complete = false;
     }
-    settled = complete && now - st.mtimeMs >= DIR_SETTLE_MS ? st.mtimeMs : null;
+    unreadable = [...files.values()].some((f) => f.error);
     return files;
   };
 }
