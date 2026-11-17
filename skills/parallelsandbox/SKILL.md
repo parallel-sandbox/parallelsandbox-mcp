@@ -1,6 +1,7 @@
 ---
 name: parallelsandbox
 description: >
+  A row of in-progress test builds of your app. Use each one, say what's wrong and circle it on screen, and your AI makes the next version. That's how you iterate your user experience fast.
   Use ParallelSandbox when a task needs a real remote computer to build, run and test a repository: docker compose
   stacks, services with ports, browser end-to-end tests, screenshots and screen recordings, anything that must not run
   on the user's own computer, and any step a person must do by hand on a live screen (logins, two-factor codes,

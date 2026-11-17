@@ -1,5 +1,9 @@
 # parallelsandbox-mcp
 
+ParallelSandbox lines up the test builds your AI is working on, side by side. Open any build and use it like a real user. When something is off, just say it and circle it on the screen. Your feedback goes straight to the AI that built it, and the next version comes back for you to try. Use, talk, circle, repeat: that is how you iterate your app's user experience fast.
+
+This package is the local stdio adapter that connects your AI to ParallelSandbox, and it can send a folder from your machine, including changes you have not committed yet.
+
 stdio adapter for the ParallelSandbox MCP server. It exposes the same tools as `https://mcp.parallelsandbox.com/mcp`
 (`sandbox_*`, `logs_*`), signing in with OAuth, and implements `sandbox_sync` and `sandbox_pull`
 locally: an agent can upload its working directory into a box without committing, and write files from the box back to

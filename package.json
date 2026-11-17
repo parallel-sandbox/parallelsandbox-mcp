@@ -1,8 +1,8 @@
 {
   "name": "parallelsandbox-mcp",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "mcpName": "com.parallelsandbox/parallelsandbox",
-  "description": "stdio adapter for the ParallelSandbox MCP server: runs locally so sandbox_sync and sandbox_pull can move files between your machine and a box",
+  "description": "A row of in-progress test builds of your app. Use each one, say what's wrong and circle it on screen, and your AI makes the next version. That's how you iterate your user experience fast.",
   "type": "module",
   "bin": {
     "parallelsandbox-mcp": "index.mjs",

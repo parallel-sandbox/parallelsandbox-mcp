@@ -1,6 +1,6 @@
 {
   "name": "parallelsandbox",
-  "description": "ParallelSandbox for Claude Code: remote Linux computers for building, running and testing code, and handing a working version to a person to try.",
+  "description": "A row of in-progress test builds of your app. Use each one, say what's wrong and circle it on screen, and your AI makes the next version. That's how you iterate your user experience fast.",
   "owner": {
     "name": "ParallelSandbox",
     "url": "https://parallelsandbox.com"
@@ -9,7 +9,7 @@
     {
       "name": "parallelsandbox",
       "source": "./",
-      "description": "Remote Linux computers for Claude Code: build, run and test code in a sandbox, sync files from your checkout, design screens before building, and hand a working version to a person to try."
+      "description": "A row of in-progress test builds of your app. Use each one, say what's wrong and circle it on screen, and your AI makes the next version. That's how you iterate your user experience fast."
     }
   ]
 }

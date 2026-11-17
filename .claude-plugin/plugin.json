@@ -1,7 +1,7 @@
 {
   "name": "parallelsandbox",
-  "version": "0.7.6",
-  "description": "Remote Linux computers for Claude Code: build, run and test a repository in a sandbox with Docker, browsers and phones, sync files from your checkout, sketch screens and architecture before building, and hand a working version to a person to try, with their feedback returned to the conversation.",
+  "version": "0.7.7",
+  "description": "A row of in-progress test builds of your app. Use each one, say what's wrong and circle it on screen, and your AI makes the next version. That's how you iterate your user experience fast.",
   "author": { "name": "ParallelSandbox", "url": "https://parallelsandbox.com" },
   "homepage": "https://parallelsandbox.com",
   "repository": "https://github.com/parallel-sandbox/parallelsandbox-mcp",
