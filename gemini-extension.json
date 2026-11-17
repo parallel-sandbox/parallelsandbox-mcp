@@ -1,11 +1,11 @@
 {
   "name": "parallelsandbox",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "description": "A row of in-progress test builds of your app. Use each one, say what's wrong and circle it on screen, and your AI makes the next version. That's how you iterate your user experience fast.",
   "mcpServers": {
     "parallelsandbox": {
       "command": "npx",
-      "args": ["-y", "parallelsandbox-mcp@0.7.7"]
+      "args": ["-y", "parallelsandbox-mcp@0.7.8"]
     }
   }
 }

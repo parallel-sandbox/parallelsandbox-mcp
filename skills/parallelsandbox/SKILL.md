@@ -15,7 +15,7 @@ description: >
   in their app, and bring their circled feedback back. Do not use it for chat or research.
 ---
 
-# ParallelSandbox: your remote computer
+# ParallelSandbox: a row of test builds the person uses, talks about and circles
 
 ## Install and connect when the person asks
 
