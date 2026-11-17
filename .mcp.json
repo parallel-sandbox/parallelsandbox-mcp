@@ -2,7 +2,7 @@
   "mcpServers": {
     "parallelsandbox": {
       "command": "npx",
-      "args": ["-y", "parallelsandbox-mcp@0.7.5"]
+      "args": ["-y", "parallelsandbox-mcp@0.7.6"]
     }
   }
 }

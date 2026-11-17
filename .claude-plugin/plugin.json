@@ -1,6 +1,6 @@
 {
   "name": "parallelsandbox",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "description": "Remote Linux computers for Claude Code: build, run and test a repository in a sandbox with Docker, browsers and phones, sync files from your checkout, sketch screens and architecture before building, and hand a working version to a person to try, with their feedback returned to the conversation.",
   "author": { "name": "ParallelSandbox", "url": "https://parallelsandbox.com" },
   "homepage": "https://parallelsandbox.com",
