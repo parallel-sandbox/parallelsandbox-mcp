@@ -348,14 +348,28 @@ test("shutdown aborts the idle claim and leaves unacknowledged feedback replayab
   assert.equal(next.feedbackNotices().length, 1);
 });
 
-test("plugin declares the native channel route without permission relay or lifecycle wake hooks", () => {
+// Plugin review holds a plugin that runs a file from its own folder or an unpinned npx: the plugin and the Gemini extension
+// start this release from npm, as an ordinary adapter, so sync, pull and the hook feedback route work as in a manual install.
+test("plugin and extension start the pinned adapter release without the experimental channel or lifecycle hooks", () => {
   assert.deepEqual(CLAUDE_CHANNEL_CAPABILITIES, { experimental: { "claude/channel": {} } });
-  const config = JSON.parse(readFileSync(new URL("./.mcp.json", import.meta.url), "utf8"));
-  assert.deepEqual(config.mcpServers.parallelsandbox, { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/index.mjs"], env: { PSBX_FEEDBACK_HOST: "claude-code" } });
-  const manifest = JSON.parse(readFileSync(new URL("./.claude-plugin/plugin.json", import.meta.url), "utf8"));
+  const read = (path) => JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
+  const { version } = read("./package.json");
+  const pinned = { command: "npx", args: ["-y", `parallelsandbox-mcp@${version}`] };
+  assert.deepEqual(read("./.mcp.json").mcpServers.parallelsandbox, pinned);
+  const manifest = read("./.claude-plugin/plugin.json");
   assert.equal(manifest.name, "parallelsandbox");
+  assert.equal(manifest.version, version);
   assert.equal(manifest.hooks, undefined);
   assert.equal(manifest.channels?.some((channel) => channel.permission), undefined);
+  const gemini = read("./gemini-extension.json");
+  assert.equal(gemini.name, "parallelsandbox");
+  assert.equal(gemini.version, version);
+  assert.deepEqual(gemini.mcpServers.parallelsandbox, pinned);
+  for (const text of [manifest.description, gemini.description, ...read("./.claude-plugin/marketplace.json").plugins.map((p) => p.description)]) {
+    assert.doesNotMatch(text, /experimental|unsupported/i);
+  }
+  const skill = readFileSync(new URL("./skills/parallelsandbox/SKILL.md", import.meta.url), "utf8");
+  assert.match(skill, /^---\nname: parallelsandbox\n/);
 });
 
 test("stdio integration exposes the native ready tool before OAuth without leaking its nonce", async (t) => {

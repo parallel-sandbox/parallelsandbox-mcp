@@ -1,0 +1,11 @@
+{
+  "name": "parallelsandbox",
+  "version": "0.7.5",
+  "description": "Remote Linux computers for Gemini CLI: build, run and test a repository in a sandbox with Docker, browsers and phones, sync files from your checkout, design screens before building, and hand a working version to a person to try.",
+  "mcpServers": {
+    "parallelsandbox": {
+      "command": "npx",
+      "args": ["-y", "parallelsandbox-mcp@0.7.5"]
+    }
+  }
+}

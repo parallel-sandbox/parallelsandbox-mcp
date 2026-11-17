@@ -1,9 +1,10 @@
 {
   "name": "parallelsandbox",
-  "version": "0.7.4",
-  "description": "ParallelSandbox tools for Claude Code. Legacy native Channel integration is experimental; registered-session feedback uses parallelsandbox-agent.",
-  "author": { "name": "ParallelSandbox" },
+  "version": "0.7.5",
+  "description": "Remote Linux computers for Claude Code: build, run and test a repository in a sandbox with Docker, browsers and phones, sync files from your checkout, sketch screens and architecture before building, and hand a working version to a person to try, with their feedback returned to the conversation.",
+  "author": { "name": "ParallelSandbox", "url": "https://parallelsandbox.com" },
   "homepage": "https://parallelsandbox.com",
   "repository": "https://github.com/parallel-sandbox/parallelsandbox-mcp",
-  "license": "MIT"
+  "license": "MIT",
+  "keywords": ["sandbox", "remote", "testing", "docker", "browser", "mcp"]
 }

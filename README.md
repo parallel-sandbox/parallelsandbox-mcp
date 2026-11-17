@@ -19,6 +19,27 @@ claude mcp add parallelsandbox -- npx -y parallelsandbox-mcp
 
 Any other MCP client: run the command above as a stdio server.
 
+Claude Code plugin (the adapter at this release, plus the ParallelSandbox skill):
+
+```bash
+/plugin install parallelsandbox --marketplace parallel-sandbox/parallelsandbox-mcp
+```
+
+Gemini CLI extension (the same adapter and skill):
+
+```bash
+gemini extensions install https://github.com/parallel-sandbox/parallelsandbox-mcp
+```
+
+The skill alone, for any agent that reads skills (`skills/parallelsandbox/SKILL.md`, also at
+https://parallelsandbox.com/skill/SKILL.md):
+
+```bash
+npx skills add parallel-sandbox/parallelsandbox-mcp
+```
+
+The plugin and the extension start `npx -y parallelsandbox-mcp@<version>`, pinned to the release they come with.
+
 The first connection starts immediately, then opens the browser for OAuth. Until sign-in finishes, the
 `parallelsandbox_connect` tool returns the sign-in link. Afterwards the adapter announces its sandbox and log tools;
 clients that do not reload tool lists need to reconnect once. Call `parallelsandbox_connect` again to check status or

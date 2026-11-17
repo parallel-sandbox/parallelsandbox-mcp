@@ -280,7 +280,7 @@ const log = (...args) => console.error("[parallelsandbox-mcp]", ...args);
 const oauth = API_KEY ? null : new OAuthSession({ mcpUrl: MCP_URL, log });
 const authorizedFetch = (url, init) => oauth ? oauth.fetch(url, init) : fetch(url, init);
 
-const remote = new Client({ name: "parallelsandbox-mcp", version: "0.7.4" });
+const remote = new Client({ name: "parallelsandbox-mcp", version: "0.7.5" });
 // 同一個 headers 物件每次請求都會被讀到，所以握手拿到對方是誰之後直接塞進去。
 // 沒有這個，control 只知道「某個 API key 開了箱子」，人在 app 裡看不出是 Claude 還是 Codex 在用。
 const managedSession = sessionBridge();
@@ -1871,9 +1871,9 @@ if (connect && API_KEY) await connectRemote();
 const feedbackHost = process.env.PSBX_FEEDBACK_HOST || "";
 if (managedSession && feedbackHost) throw new Error("A managed session must have one feedback owner; remove PSBX_FEEDBACK_HOST");
 if (feedbackHost && !["claude-code", "codex"].includes(feedbackHost)) throw new Error("PSBX_FEEDBACK_HOST must be claude-code or codex");
-const server = new Server({ name: "parallelsandbox", version: "0.7.4" }, {
+const server = new Server({ name: "parallelsandbox", version: "0.7.5" }, {
   capabilities: { tools: { listChanged: true }, ...(feedbackHost === "claude-code" ? CLAUDE_CHANNEL_CAPABILITIES : {}) },
-  instructions: [connected ? remote.getInstructions() : "ParallelSandbox is signing in. Call parallelsandbox_connect to get the sign-in link or check completion. After sign-in, its sandbox_* and logs_* tools become available. Give every box a goal and finish with sandbox_review or sandbox_stop.", feedbackHost === "claude-code" ? CLAUDE_CHANNEL_INSTRUCTIONS : "", !managedSession && !feedbackHost ? setupInstructions() : ""].filter(Boolean).join("\n\n"),
+  instructions: [connected ? remote.getInstructions() : "ParallelSandbox is signing in. parallelsandbox_connect returns the sign-in link or reports completion; after sign-in its sandbox_* and logs_* tools become available. Each box takes a goal and ends with sandbox_review or sandbox_stop.", feedbackHost === "claude-code" ? CLAUDE_CHANNEL_INSTRUCTIONS : "", !managedSession && !feedbackHost ? setupInstructions() : ""].filter(Boolean).join("\n\n"),
 });
 claudeChannel = feedbackHost === "claude-code" ? createClaudeChannel({server, authorizedFetch, apiUrl: API_URL, headers: remoteHeaders, consumerId: AGENT_ID}) : null;
 codexFeedback = feedbackHost === "codex" ? createCodexFeedback({
@@ -1888,7 +1888,8 @@ codexFeedback = feedbackHost === "codex" ? createCodexFeedback({
 const feedbackRoute = connect && !managedSession && !feedbackHost ? createFeedbackRoute({
   apiUrl: API_URL, mcpUrl: MCP_URL, agentId: AGENT_ID, authorizedFetch, headers: remoteHeaders, log,
 }) : null;
-const connectTool = { name: "parallelsandbox_connect", description: "Connect ParallelSandbox, or check sign-in status. If sign-in is pending, show the person the returned link to sign in and allow their AI tool. Call again after they finish.", inputSchema: { type: "object", properties: {} } };
+// Directory review (Claude, OpenAI) wants a title and all three hints on every tool: sign-in changes only this adapter's own token store.
+const connectTool = { name: "parallelsandbox_connect", description: "Start ParallelSandbox sign-in, or report its status. While sign-in is pending the result has a link for the person to sign in and allow their AI tool; once they finish, the next call completes the connection.", inputSchema: { type: "object", properties: {} }, annotations: { title: "Connect ParallelSandbox", readOnlyHint: false, destructiveHint: false, openWorldHint: false } };
 let signingIn = null;
 function beginSignIn() {
   if (signingIn) return;

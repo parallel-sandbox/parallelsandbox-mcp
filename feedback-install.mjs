@@ -138,7 +138,7 @@ export function setupInstructions(opts = {}) {
   if (!missing.length) return "";
   const names = { "claude-code": "Claude Code", cursor: "Cursor", gemini: "Gemini CLI" };
   return [
-    "App feedback setup: when the person submits feedback in the ParallelSandbox App, it returns to the conversation that requested the review. Codex needs nothing. The following clients need ParallelSandbox's hooks in the person's user settings, once per machine. Changing their settings needs their consent: before your first sandbox_review, ask the person in this conversation whether you may run the command for the client you are running in:",
+    "App feedback setup: feedback the person submits in the ParallelSandbox App returns to the conversation that requested the review. Codex needs nothing. The following clients need ParallelSandbox's hooks in the person's user settings, once per machine; the command changes their settings, so it runs only with their consent:",
     ...missing.map((h) => `- ${names[h]}: ${DEFAULT_COMMAND} install ${h}`),
     "The command only adds ParallelSandbox's hooks to that client's user settings, keeps a backup of the previous file and can be run again safely. Claude Code and Cursor apply them to the running conversation; Gemini CLI applies them from its next start.",
   ].join("\n");

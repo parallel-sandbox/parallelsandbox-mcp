@@ -1,11 +1,15 @@
 {
   "name": "parallelsandbox",
-  "owner": { "name": "ParallelSandbox" },
+  "description": "ParallelSandbox for Claude Code: remote Linux computers for building, running and testing code, and handing a working version to a person to try.",
+  "owner": {
+    "name": "ParallelSandbox",
+    "url": "https://parallelsandbox.com"
+  },
   "plugins": [
     {
       "name": "parallelsandbox",
       "source": "./",
-      "description": "ParallelSandbox tools and development native-channel checks; automatic feedback routing is currently unsupported."
+      "description": "Remote Linux computers for Claude Code: build, run and test code in a sandbox, sync files from your checkout, design screens before building, and hand a working version to a person to try."
     }
   ]
 }

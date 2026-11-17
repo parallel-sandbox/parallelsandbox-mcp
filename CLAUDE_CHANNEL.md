@@ -5,15 +5,15 @@
 
 This development integration does not currently support automatic Claude feedback routing. Its isolated protocol tests pass; authenticated native idle wake-up and native queue isolation across `/clear` or `/resume` have not been verified. The current adapter therefore refuses feedback binding and polling, including after a successful channel activation challenge. Saved reports remain readable with `sandbox_report`. The integration does not open another conversation, run a headless `--resume`, or keep an AI tool call waiting to imitate a wake-up.
 
-The plugin's MCP process starts automatically when Claude loads the plugin. During Claude's channels research preview, installing an MCP server or plugin alone does not activate inbound events. ParallelSandbox is a custom channel and requires explicit startup opt-in and Claude's development-channel confirmation:
+During Claude's channels research preview, installing an MCP server or plugin alone does not activate inbound events. ParallelSandbox is a custom channel and requires explicit startup opt-in and Claude's development-channel confirmation:
 
 ```sh
-claude --dangerously-load-development-channels plugin:parallelsandbox@parallelsandbox
+claude --dangerously-load-development-channels server:parallelsandbox-channel
 ```
 
-For an existing session, pass its exact UUID with `--resume` when restarting with that explicit opt-in. Do not use `--continue`, `--fork-session`, or `--bg` to choose the feedback destination. No global Claude configuration is changed by this package. Install this plugin at the project/local scope if desired; do not configure a second ordinary ParallelSandbox MCP server in the same session.
+For an existing session, pass its exact UUID with `--resume` when restarting with that explicit opt-in. Do not use `--continue`, `--fork-session`, or `--bg` to choose the feedback destination. No global Claude configuration is changed by this package. Do not configure a second ordinary ParallelSandbox MCP server (or the plugin) in the same session.
 
-The packaged plugin root is this package directory: `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `.mcp.json` are included together with the adapter and its installed Node dependencies. A local checkout must have its dependencies installed before Claude starts its `node index.mjs` server. The plugin uses `PSBX_FEEDBACK_HOST=claude-code`; ordinary adapter installations do not opt into the channel automatically. This development version has not been published to npm or a plugin registry.
+Since 0.7.5 the published plugin (`.claude-plugin/`, `.mcp.json`) no longer opts into this channel: it starts the pinned npm release as an ordinary adapter, so feedback uses the `asyncRewake` hook route. To try the channel, run a local checkout (with its dependencies installed) as a separate stdio server with `PSBX_FEEDBACK_HOST=claude-code`, for example `claude mcp add parallelsandbox-channel --env PSBX_FEEDBACK_HOST=claude-code -- node /path/to/parallelsandbox-mcp/index.mjs`, and start Claude with `--dangerously-load-development-channels server:parallelsandbox-channel`. Ordinary adapter installations do not opt into the channel automatically.
 
 Claude Code introduced channels in 2.1.80. Availability is controlled by Claude authentication and research-preview rollout. Team/Enterprise administrators must explicitly permit channels. The currently inspected 2.1.114 client requires claude.ai authentication; current official documentation also supports a Console API key on newer clients. Bedrock, Google Cloud Agent Platform, and Foundry are outside the documented support. A model proxy is not evidence that the channel authentication gate is satisfied.
 

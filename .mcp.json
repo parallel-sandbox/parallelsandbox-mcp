@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "parallelsandbox": {
-      "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/index.mjs"],
-      "env": { "PSBX_FEEDBACK_HOST": "claude-code" }
+      "command": "npx",
+      "args": ["-y", "parallelsandbox-mcp@0.7.5"]
     }
   }
 }
