@@ -1,4 +1,4 @@
-// Host hook for App feedback (see feedback-relay.mjs). One script, three hosts:
+// Host hook for App feedback (see feedback-relay.mjs). One script, four hosts:
 //   claude-code  PostToolUse / SessionStart with asyncRewake: waits in the background and
 //                wakes the idle conversation by exiting 2 with the follow-up on stderr.
 //                `claude -p "<prompt>"` runs the same hook in the foreground instead: the tool
@@ -7,7 +7,10 @@
 //                not change (see desktopConversation).
 //   cursor       afterMCPExecution attaches the review; stop returns {followup_message}.
 //   gemini       AfterTool attaches the review; AfterAgent returns {decision:"block", reason}.
-// Cursor and Gemini have no idle wake: their end-of-turn hook holds for a bounded time right
+//   codex        PostToolUse attaches the review to its thread (session_id is the thread id); Stop returns
+//                {decision:"block", reason}, which Codex hands to the same turn as the next prompt. Codex Desktop
+//                does not start a turn from codex queue on its own, so this hook is how feedback reaches it.
+// Cursor, Gemini and Codex have no idle wake: their end-of-turn hook holds for a bounded time right
 // after a review was requested, and otherwise hands over waiting feedback at the next turn end.
 import { execFile } from "node:child_process";
 import { appendFileSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -213,20 +216,26 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
     } finally { if (Number(orNull(() => readFileSync(lock, "utf8"))) === process.pid) orNull(() => unlinkSync(lock)); }
   }
 
-  const endOfTurn = (host === "cursor" && event === "stop") || (host === "gemini" && event === "AfterAgent");
+  const endOfTurn = (host === "cursor" && event === "stop") || (host === "gemini" && event === "AfterAgent") || (host === "codex" && event === "Stop");
   if (!endOfTurn) { out("{}"); return 0; }
   if (host === "cursor" && input.status && input.status !== "completed") { out("{}"); return 0; }
   const hold = shouldHold({ dir, host, session: input.session, holdMs });
-  const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + (hold ? holdMs : 0) + 1, by: `${host}:${process.pid}`, ancestors: hold ? await hostAncestors() : [] });
-  if (!mail) { out("{}"); return 0; }
-  out(JSON.stringify(host === "cursor" ? { followup_message: mail.text } : { decision: "block", reason: mail.text }));
-  return 0;
+  // The relay reports a Codex thread whose turn ended without this hook holding as not running, so the App can tell the
+  // person to send it a message; while holding, this hook is that thread's waiter.
+  const lock = host === "codex" && hold ? waiterPidFile(dir, host, input.session) : "";
+  if (lock) { privateDir(paths(dir).run); writeFileSync(lock, String(process.pid), { mode: 0o600 }); }
+  try {
+    const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + (hold ? holdMs : 0) + 1, by: `${host}:${process.pid}`, ancestors: hold ? await hostAncestors() : [] });
+    if (!mail) { out("{}"); return 0; }
+    out(JSON.stringify(host === "cursor" ? { followup_message: mail.text } : { decision: "block", reason: mail.text }));
+    return 0;
+  } finally { if (lock && Number(orNull(() => readFileSync(lock, "utf8"))) === process.pid) orNull(() => unlinkSync(lock)); }
 }
 
 export async function hookMain(argv = process.argv.slice(2)) {
   const i = argv.indexOf("--host");
   const host = i >= 0 ? argv[i + 1] : "";
-  if (!["claude-code", "cursor", "gemini"].includes(host)) { process.stderr.write("hook --host <claude-code|cursor|gemini>\n"); return 0; }
+  if (!["claude-code", "cursor", "gemini", "codex"].includes(host)) { process.stderr.write("hook --host <claude-code|cursor|gemini|codex>\n"); return 0; }
   let raw = {};
   try { raw = JSON.parse((await readHookInput()) || "{}"); }
   catch (e) { hookLog(defaultFeedbackDir(), `${host} hook input unreadable: ${e?.code || e?.message || e}`); } // Never break the host over a malformed input.

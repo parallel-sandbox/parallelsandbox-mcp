@@ -5,11 +5,14 @@
 //               and starts the relay. A design version (dsn_…) has no box: its feedback is bound, claimed and read
 //               by reviewId and reportId alone.
 //   host     -> tells which conversation owns the review:
-//                 Codex: tools/call _meta.threadId (the adapter records it in the ticket)
+//                 Codex: tools/call _meta.threadId (the adapter records it in the ticket); with ParallelSandbox's
+//                        Codex hooks installed and trusted, its PostToolUse hook also attaches that thread
 //                 Claude Code, Cursor, Gemini CLI: their after-tool hook attaches its session id
 //   relay    -> registers a feedback consumer per conversation, claims App reports, delivers:
-//                 codex  : `codex queue --thread` into Codex's own follow-up queue
-//                 hook   : a private mailbox the conversation's hook waits on (feedback-hook.mjs)
+//                 hook   : a private mailbox the conversation's hook waits on (feedback-hook.mjs); a Codex thread
+//                          its hook attached takes it here, at the end of its turn (Stop)
+//                 codex  : otherwise `codex queue --thread` into Codex's own follow-up queue, which runs only while a
+//                          Codex CLI or app-server daemon has the thread loaded (Codex Desktop does not run it)
 //               and acknowledges host acceptance only after the host took the follow-up.
 //               A Claude Code follow-up no waiter is left to take (the conversation is closed or was stopped
 //               by Claude Desktop) is reported to the App as host_inactive, so the person can resume it.
@@ -33,7 +36,7 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 export const TICKET_LIFETIME_MS = 7 * 24 * 3600_000; // Reports and media are kept for 7 days.
-export const HOOK_HOSTS = Object.freeze(["claude-code", "cursor", "gemini"]);
+export const HOOK_HOSTS = Object.freeze(["claude-code", "cursor", "gemini", "codex"]);
 export const CAPABILITIES = Object.freeze({ codex: "codex/thread-queue", "claude-code": "claude-code/async-rewake", cursor: "cursor/stop-followup", gemini: "gemini-cli/after-agent" });
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const sha = (...parts) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
@@ -222,7 +225,8 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
       writeJson(file, ticket);
       await spawnRelay({ dir, credKey, env, log });
       if (threadId && !ticket.codex) return { automatic: false, host: "codex", reason: "codex_cli_not_found", note: "Set PSBX_CODEX_CLI to this host's absolute codex executable." };
-      if (ticket.codex) return { automatic: true, host: "codex", route: "codex queue", threadId };
+      // Codex Desktop does not run codex queue on its own: feedback is automatic once the Codex hooks are installed and trusted.
+      if (ticket.codex) return { automatic: "when_hooks_installed", host: "codex", route: "Codex Stop hook", threadId };
       return { automatic: "when_hooks_installed", host: clientName || "unknown", route: "host hook" };
     },
     // The original conversation read this exact report: the App receipt becomes `read`. A design report is read without
@@ -266,7 +270,9 @@ export function attachReview({ dir = defaultFeedbackDir(), host, session, boxId,
   const p = paths(dir);
   const key = ticketKey(boxId, reviewId);
   const ticket = orNull(() => readJson(join(p.tickets, `${key}.json`)));
-  if (!ticket || Date.now() > ticket.expiresAt || ticket.codex) return false;
+  if (!ticket || Date.now() > ticket.expiresAt) return false;
+  // A Codex review belongs to the thread its tool call named; only that thread's own hook takes it over from codex queue.
+  if (ticket.codex && (host !== "codex" || ticket.codex.threadId !== session)) return false;
   privateDir(p.attach);
   const file = join(p.attach, `${key}.json`);
   const prev = orNull(() => readJson(file));
@@ -415,8 +421,10 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
       }
     };
     const request = (ticket, agentId, path, body) => call(ticket, agentId, `/v1/feedback-consumers${path}`, body);
+    // A Codex thread whose hook attached the review takes feedback through that hook (same consumer: host codex, its
+    // thread id); without the hook only codex queue reaches it.
     const targetOf = (ticket, a) => {
-      if (ticket.codex) return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
+      if (ticket.codex && a?.host !== "codex") return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
       return a ? { kind: "hook", host: a.host, id: a.session } : null;
     };
     // Where a ticket's feedback goes, worked out again only when its ticket or attach file changed.
@@ -457,13 +465,14 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         say("acknowledged", event.reportId, j.state);
       }
     };
-    // Claude Code takes a mailed follow-up only through a live waiter. While none runs, the conversation is not
-    // running (closed, or stopped by Claude Desktop while idle) and the App asks the person to send it a message;
-    // the follow-up stays mailed for the waiter that starts when the conversation runs again.
+    // Claude Code takes a mailed follow-up only through a live waiter, and a Codex thread only through its Stop hook
+    // holding at the end of a turn. While none runs, the conversation is not running (closed, stopped by Claude Desktop
+    // while idle, or a Codex turn that already ended) and the App asks the person to send it a message; the follow-up
+    // stays mailed for the waiter or Stop hook of that conversation's next turn.
     let hostReports = true;
     const hostChecked = new Map(); // eventId -> last check, so a long-running relay runs ps at most every HOST_CHECK_MS
     const reportHost = async (consumer, j, jpath) => {
-      if (!hostReports || consumer.target.host !== "claude-code" || Date.now() - (j.mailedAt || 0) < hostGraceMs) return;
+      if (!hostReports || !["claude-code", "codex"].includes(consumer.target.host) || Date.now() - (j.mailedAt || 0) < hostGraceMs) return;
       if (!once) { if (Date.now() - (hostChecked.get(j.eventId) || 0) < HOST_CHECK_MS) return; hostChecked.set(j.eventId, Date.now()); }
       const inactive = !(await waiting({ dir, host: j.host, session: j.target }));
       if (inactive === !!j.hostInactive) return;
@@ -665,7 +674,8 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         if (Date.now() > ticket?.expiresAt) { orNull(() => unlinkSync(path)); orNull(() => unlinkSync(join(p.attach, name))); setAside.delete(key); continue; }
         if (!ticket || ticket.credKey !== credKey) continue;
         active++;
-        const { target, consumerId } = routeOf(file, ticket.codex ? undefined : attached.get(name));
+        const attach = attached.get(name);
+        const { target, consumerId } = routeOf(file, ticket.codex && attach?.value?.host !== "codex" ? undefined : attach);
         if (!target) continue;
         if (gone.has(consumerId)) continue;
         if (bound.get(key) !== consumerId) {

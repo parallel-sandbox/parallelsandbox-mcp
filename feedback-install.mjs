@@ -27,11 +27,15 @@ export function hostFromClient(name = "") {
 const settingsFile = (host, { home = homedir(), env = process.env } = {}) =>
   host === "claude-code" ? join(env.CLAUDE_CONFIG_DIR || join(home, ".claude"), "settings.json")
     : host === "cursor" ? join(home, ".cursor", "hooks.json")
-      : host === "gemini" ? join(home, ".gemini", "settings.json") : "";
+      : host === "gemini" ? join(home, ".gemini", "settings.json")
+        : host === "codex" ? join(env.CODEX_HOME || join(home, ".codex"), "hooks.json") : "";
 
 // Are this host's feedback hooks in its user settings?
 export function hooksInstalled(host, opts = {}) {
-  if (host === "codex") return true;
+  return hooksWritten(host, opts) && (host !== "codex" || codexHooksTrusted(opts));
+}
+
+function hooksWritten(host, opts = {}) {
   const file = settingsFile(host, opts);
   if (!file || !existsSync(file)) return false;
   try {
@@ -40,6 +44,20 @@ export function hooksInstalled(host, opts = {}) {
     // 舊版裝的 matcher 比現在少（例如還沒有草稿、架構圖、Schema 工具）就當成沒裝：重裝會換成現在的
     const matchers = Object.values(hostConfig(host, opts)?.add || {}).flat().map((e) => e.matcher).filter(Boolean);
     return matchers.every((m) => text.includes(m));
+  } catch { return false; }
+}
+
+// Codex runs a hook only after the person trusted it; config.toml keeps that per hook as
+// [hooks.state."<hooks.json>:<event>:<group>:<hook>"] with a trusted_hash.
+export function codexHooksTrusted({ home = homedir(), env = process.env } = {}) {
+  const codexHome = env.CODEX_HOME || join(home, ".codex");
+  const file = join(codexHome, "hooks.json");
+  try {
+    const config = readFileSync(join(codexHome, "config.toml"), "utf8");
+    return ["stop", "post_tool_use"].every((event) => {
+      const at = config.indexOf(`[hooks.state."${file}:${event}:`);
+      return at >= 0 && /^\s*trusted_hash\s*=/m.test(config.slice(at, config.indexOf("\n[", at + 1) >>> 0));
+    });
   } catch { return false; }
 }
 
@@ -66,10 +84,19 @@ export function hostConfig(host, { command = DEFAULT_COMMAND, home = homedir(), 
       AfterAgent: [{ hooks: [{ type: "command", command: hook("gemini"), timeout: 1_800_000 }] }],
     },
   };
+  // Codex (Desktop, CLI, IDE) runs ~/.codex/hooks.json once the person trusts it ("Hooks need review"); the Stop hook
+  // holds up to PSBX_HOOK_HOLD_SEC (20 minutes) after a review, so its timeout leaves room for that.
+  if (host === "codex") return {
+    file: settingsFile("codex", { home, env }),
+    add: {
+      PostToolUse: [{ matcher: "mcp__.*__sandbox_(review|report|draft|architecture|schema)", hooks: [{ type: "command", command: hook("codex"), timeout: 30 }] }],
+      Stop: [{ hooks: [{ type: "command", command: hook("codex"), timeout: 1800, statusMessage: "ParallelSandbox: checking for App feedback" }] }],
+    },
+  };
   return null;
 }
 
-const ours = (entry) => { const t = JSON.stringify(entry); return t.includes(MARK) || / hook --host (claude-code|cursor|gemini)\b/.test(t); };
+const ours = (entry) => { const t = JSON.stringify(entry); return t.includes(MARK) || / hook --host (claude-code|cursor|gemini|codex)\b/.test(t); };
 
 // Pure merge: drops earlier ParallelSandbox entries, appends the current ones.
 export function mergeHooks(settings, config) {
@@ -82,7 +109,6 @@ export function mergeHooks(settings, config) {
 }
 
 export function install(host, opts = {}) {
-  if (host === "codex") return { host, changed: false, note: "Codex needs no hooks: App feedback is queued into the original conversation with `codex queue`." };
   const config = hostConfig(host, opts);
   if (!config) throw new Error("install <claude-code|cursor|gemini|codex>");
   let current = {};
@@ -102,14 +128,19 @@ export function installMain(argv = process.argv.slice(2)) {
   const result = install(host, { ...(opt("command") ? { command: opt("command") } : {}), ...(opt("home") ? { home: opt("home") } : {}) });
   console.log(JSON.stringify(result, null, 2));
   if (result.changed) console.log("Installed. ParallelSandbox reviews requested from now on return App feedback to the conversation that asked for them.");
+  if (result.changed && host === "codex") console.log("Codex shows \"Hooks need review\" the next time it starts a conversation: choose \"Trust all and continue\" once.");
   return 0;
 }
 
 // Usage note for the AI in a tool result when this host's hooks are missing.
 export function installNote(clientName, opts = {}) {
   const host = hostFromClient(clientName);
-  if (!host || host === "codex" || hooksInstalled(host, opts)) return null;
+  if (!host || hooksInstalled(host, opts)) return null;
   const command = `${DEFAULT_COMMAND} install ${host}`;
+  if (host === "codex" && hooksWritten(host, opts)) return {
+    host, installed: true, trusted: false, command,
+    usage: "ParallelSandbox setup step for this conversation (not done yet): ParallelSandbox's Codex hooks are installed but Codex has not been told to trust them, so App feedback does not return to this conversation. Ask the person to trust them once: Codex shows \"Hooks need review\" when it starts a conversation (or /hooks in Codex CLI); they choose \"Trust all and continue\".",
+  };
   return {
     host, installed: false, command,
     usage: `ParallelSandbox setup step for this conversation (not done yet): App feedback returns to this conversation only after ParallelSandbox's ${host} hooks are in the person's user settings. Changing their settings needs their consent, so ask them now, in this conversation, whether you may run this once: ${command}\nIt only adds ParallelSandbox's hooks to those settings, keeps a backup of the previous file and can be run again safely.`,
@@ -129,17 +160,18 @@ export function reviewInstallNote(clientName, { id, reviewId }, opts = {}) {
     return `${note.usage}\nFeedback on this design version does not return to this conversation automatically, even after the install, and sandbox_review cannot re-register it: when the person says they sent it, read it with sandbox_report. ${after} return here on their own.`;
   }
   if (note.host === "gemini") return `${note.usage}\nGemini CLI loads hooks when it starts, so feedback for this review is not routed automatically in this run: sandbox_status or sandbox_review for box ${id} hands a submitted report to you. Reviews requested after Gemini CLI restarts return automatically.`;
+  if (note.host === "codex") return `${note.usage}\nCodex loads hooks when a conversation starts and asks the person once to trust them ("Hooks need review": "Trust all and continue"), so feedback for this review is not routed automatically in this conversation: sandbox_status or sandbox_review for box ${id} hands a submitted report to you. Reviews requested in Codex conversations started after that return automatically.`;
   return `${note.usage}\nOnce the person agrees and it is installed, call sandbox_review with ${JSON.stringify({ id, reviewId, waitSec: 0 })} once so this review's feedback returns here. Until then, read submitted reports with sandbox_report.`;
 }
 
 // Server instructions (system prompt level) for hosts whose hooks are missing on this machine.
 export function setupInstructions(opts = {}) {
-  const missing = ["claude-code", "cursor", "gemini"].filter((h) => !hooksInstalled(h, opts));
+  const missing = ["claude-code", "cursor", "gemini", "codex"].filter((h) => !hooksInstalled(h, opts));
   if (!missing.length) return "";
-  const names = { "claude-code": "Claude Code", cursor: "Cursor", gemini: "Gemini CLI" };
+  const names = { "claude-code": "Claude Code", cursor: "Cursor", gemini: "Gemini CLI", codex: "Codex" };
   return [
-    "App feedback setup: feedback the person submits in the ParallelSandbox App returns to the conversation that requested the review. Codex needs nothing. The following clients need ParallelSandbox's hooks in the person's user settings, once per machine; the command changes their settings, so it runs only with their consent:",
+    "App feedback setup: feedback the person submits in the ParallelSandbox App returns to the conversation that requested the review. The following clients need ParallelSandbox's hooks in the person's user settings, once per machine; the command changes their settings, so it runs only with their consent:",
     ...missing.map((h) => `- ${names[h]}: ${DEFAULT_COMMAND} install ${h}`),
-    "The command only adds ParallelSandbox's hooks to that client's user settings, keeps a backup of the previous file and can be run again safely. Claude Code and Cursor apply them to the running conversation; Gemini CLI applies them from its next start.",
+    "The command only adds ParallelSandbox's hooks to that client's user settings, keeps a backup of the previous file and can be run again safely. Claude Code and Cursor apply them to the running conversation; Gemini CLI applies them from its next start; Codex from its next conversation, after the person trusts them once (\"Hooks need review\": \"Trust all and continue\").",
   ].join("\n");
 }

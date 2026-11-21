@@ -73,7 +73,7 @@ test("host CLI is the codex process that launched the adapter", async () => {
 test("Codex review: ticket names the thread, relay queues one follow-up and acknowledges it", async () => {
   const dir = tmp();
   const out = await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
-  assert.equal(out.automatic, true);
+  assert.equal(out.automatic, "when_hooks_installed", "Codex Desktop runs nothing from codex queue on its own");
   const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]);
   const queued = [];
   await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, queue: async (t, msg) => { queued.push({ t, msg }); return "q1"; } });
@@ -275,6 +275,95 @@ async function mailed(host, session, over = {}) {
   return dir;
 }
 
+// What Codex writes to config.toml when the person chooses "Trust all and continue" for ~/.codex/hooks.json.
+function trustCodexHooks(codexHome) {
+  const file = join(codexHome, "hooks.json");
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(join(codexHome, "config.toml"), ['model = "x"', "", "[hooks.state]", "",
+    `[hooks.state."${file}:post_tool_use:0:0"]`, 'trusted_hash = "sha256:aa"', "", `[hooks.state."${file}:stop:0:0"]`, 'trusted_hash = "sha256:bb"', ""].join("\n"));
+}
+
+const codexReviewResult = (reviewId) => ({ content: [{ type: "text", text: JSON.stringify({ ok: true, reviewId, url: "https://app.test/review" }) }] });
+
+// Codex Desktop never starts a turn from codex queue (11/21: queued follow-ups sat unread for days), so with ParallelSandbox's
+// Codex hooks the thread's own PostToolUse attaches the review and its Stop hook takes the feedback into the same turn.
+test("Codex with its hooks: the thread attaches its review, the relay mails it instead of codex queue, and Stop blocks with it", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev123", clientName: "codex-mcp-client", meta: { threadId: T } });
+  let out = "";
+  const post = { hook_event_name: "PostToolUse", session_id: T, tool_name: "mcp__parallelsandbox__sandbox_review", tool_input: { id: "box1" }, tool_response: codexReviewResult("rev123") };
+  assert.equal(await runHook({ host: "codex", dir, raw: post, out: (s) => { out = s; } }), 0);
+  assert.equal(out, "{}");
+  assert.equal(attachReview({ dir, host: "codex", session: "01a0f429-b209-77a2-b784-000000000000", boxId: "box1", reviewId: "rev123" }), false, "only the thread the tool call named");
+  assert.equal(attachReview({ dir, host: "gemini", session: T, boxId: "box1", reviewId: "rev123" }), false, "a Codex review is never another host's");
+  const be = backend([{ boxId: "box1", reviewId: "rev123", reportId: RID }]);
+  const queued = [];
+  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, queue: async (t, msg) => { queued.push({ t, msg }); return "q1"; } });
+  assert.equal(queued.length, 0, "no codex queue once the thread's hook has the review");
+  assert.equal(be.calls[0].body.host, "codex");
+  assert.equal(be.acked.size, 0, "not accepted before the thread takes it");
+  await runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "1" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: false }, out: (s) => { out = s; } });
+  assert.equal(JSON.parse(out).decision, "block");
+  assert.match(JSON.parse(out).reason, /sandbox_report tool with exactly \{"id":"box1","reportId":"11111111-2222-3333-4444-555555555555"\}/);
+  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, queue: async () => { throw new Error("never queued"); } });
+  assert.equal(be.acked.get(RID), "host_accepted");
+  await runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "1" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: true }, out: (s) => { out = s; } });
+  assert.equal(out, "{}", "nothing more to hand over");
+});
+
+test("Codex Stop right after a review holds as the thread's waiter and continues the turn when the feedback arrives", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev123", clientName: "codex-mcp-client", meta: { threadId: T } });
+  await runHook({ host: "codex", dir, raw: { hook_event_name: "PostToolUse", session_id: T, tool_name: "mcp__parallelsandbox__sandbox_review", tool_input: { id: "box1" }, tool_response: codexReviewResult("rev123") }, out: () => {} });
+  let out = "";
+  const started = Date.now();
+  const stop = runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "20" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: false }, out: (s) => { out = s; } });
+  await sleep(300);
+  assert.equal(Number(readFileSync(waiterPidFile(dir, "codex", T), "utf8")), process.pid, "the holding Stop hook is the thread's waiter");
+  const be = backend([{ boxId: "box1", reviewId: "rev123", reportId: RID }]);
+  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, queue: async () => { throw new Error("never queued"); } });
+  assert.equal(await stop, 0);
+  assert.equal(JSON.parse(out).decision, "block");
+  assert.ok(Date.now() - started < 10_000, "handed over as soon as it was mailed");
+  assert.ok(!existsSync(waiterPidFile(dir, "codex", T)), "no waiter once the turn goes on");
+});
+
+test("Codex Stop does not hold a turn that opened no review, and a Codex thread without its hooks keeps codex queue", async () => {
+  const dir = tmp();
+  let out = "";
+  const started = Date.now();
+  await runHook({ host: "codex", dir, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: false }, out: (s) => { out = s; } });
+  assert.equal(out, "{}");
+  assert.ok(Date.now() - started < 1500);
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
+  const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]);
+  const queued = [];
+  await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, queue: async (t) => { queued.push(t); return "q1"; } });
+  assert.equal(queued.length, 1);
+  assert.equal(mailFor({ dir, host: "codex", session: T }).length, 0);
+});
+
+test("installing Codex hooks: ~/.codex/hooks.json gets PostToolUse and Stop, and they count only once Codex trusts them", () => {
+  const home = tmp();
+  const env = { CODEX_HOME: join(home, "cx") };
+  const config = hostConfig("codex", { home, env, command: "psbx" });
+  assert.equal(config.file, join(home, "cx", "hooks.json"));
+  assert.equal(config.add.PostToolUse[0].matcher, "mcp__.*__sandbox_(review|report|draft|architecture|schema)");
+  assert.equal(config.add.Stop[0].hooks[0].command, "psbx hook --host codex");
+  assert.ok(config.add.Stop[0].hooks[0].timeout >= 1500, "room for the 20-minute hold");
+  assert.equal(install("codex", { home, env, command: "psbx" }).changed, true);
+  const written = JSON.parse(readFileSync(join(home, "cx", "hooks.json"), "utf8"));
+  assert.deepEqual(Object.keys(written.hooks).sort(), ["PostToolUse", "Stop"]);
+  assert.equal(hooksInstalled("codex", { home, env }), false, "not trusted yet");
+  assert.match(installNote("codex-mcp-client", { home, env }).usage, /Trust all and continue/);
+  assert.match(reviewInstallNote("codex-mcp-client", { id: "b1", reviewId: "r1" }, { home, env }), /Trust all and continue/);
+  trustCodexHooks(env.CODEX_HOME);
+  assert.equal(hooksInstalled("codex", { home, env }), true);
+  assert.equal(installNote("codex-mcp-client", { home, env }), null);
+  install("codex", { home, env, command: "psbx" });
+  assert.equal(JSON.parse(readFileSync(join(home, "cx", "hooks.json"), "utf8")).hooks.Stop.length, 1, "reinstalling replaces, never duplicates");
+});
+
 test("Cursor stop hook returns the follow-up; Gemini AfterAgent blocks with it; Claude exits 2", async () => {
   let out = "";
   let dir = await mailed("cursor", "c1");
@@ -450,8 +539,8 @@ test("installer merges hooks idempotently and keeps other settings", () => {
 test("usage note appears only for a hook host without hooks, and disappears after install", () => {
   assert.deepEqual(["codex-mcp-client", "claude-code", "cursor-vscode", "Cursor", "gemini-cli-mcp-client", "other"].map((n) => hostFromClient(n)), ["codex", "claude-code", "cursor", "cursor", "gemini", ""]);
   const home = tmp();
-  const env = { CLAUDE_CONFIG_DIR: join(home, "cfg") };
-  assert.equal(installNote("codex-mcp-client", { home, env }), null);
+  const env = { CLAUDE_CONFIG_DIR: join(home, "cfg"), CODEX_HOME: join(home, "codex") };
+  assert.match(installNote("codex-mcp-client", { home, env }).usage, /install codex/);
   assert.equal(installNote("unknown", { home, env }), null);
   const note = installNote("claude-code", { home, env });
   assert.match(note.usage, /ask them now, in this conversation, whether you may run this once: .*install claude-code/);
@@ -471,6 +560,9 @@ test("usage note appears only for a hook host without hooks, and disappears afte
   install("gemini", { home, env, command: "psbx" });
   assert.equal(installNote("gemini-cli-mcp-client", { home, env }), null);
   install("cursor", { home, env, command: "psbx" });
+  assert.match(setupInstructions({ home, env }), /Codex: .*install codex/);
+  install("codex", { home, env, command: "psbx" });
+  trustCodexHooks(env.CODEX_HOME);
   assert.equal(setupInstructions({ home, env }), "", "nothing to say once every client is set up");
   assert.equal(selfCommand("/u/.npm/_npx/abc/node_modules/parallelsandbox-mcp/index.mjs"), "npx -y parallelsandbox-mcp");
   assert.equal(selfCommand("/src/pkg/index.mjs", "/bin/node"), '"/bin/node" "/src/pkg/index.mjs"');

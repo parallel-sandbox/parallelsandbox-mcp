@@ -1,7 +1,9 @@
 # Codex feedback bridge: development integration
 
-> The default Codex route is now `codex queue` (see README, "Feedback back to the original conversation"): it needs no socket, hook or
-> pairing, and works for Codex Desktop conversations. This App Server bridge stays an explicit opt-in experiment.
+> The default Codex route is ParallelSandbox's Codex hooks (`npx -y parallelsandbox-mcp install codex`, then trust them once in
+> Codex): `PostToolUse` attaches the review and `Stop` hands the feedback to the same turn (see README, "Feedback back to the
+> original conversation"). `codex queue` remains the fallback without them; Codex Desktop does not start a turn from it on its own.
+> This App Server bridge stays an explicit opt-in experiment.
 
 This development integration ships in the package since 0.4.3; 0.4.2 and earlier do not include these bridge files. It targets an **already-running, explicitly paired official Codex App Server** that has the original thread loaded. The current Codex Desktop installation uses private stdio and has no documented control endpoint for this bridge, so it is currently unsupported.
 

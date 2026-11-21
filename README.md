@@ -208,7 +208,7 @@ receipt read. Each host only differs in how the follow-up enters the conversatio
 
 | Host | Hooks | How the conversation receives it |
 |---|---|---|
-| Codex (Desktop, CLI, IDE) | none | The thread comes from Codex's tool-call metadata; the relay runs the host's own `codex queue --thread`. Idle threads start a turn; busy threads get it after the current turn. |
+| Codex (Desktop, CLI, IDE) | `install codex` | `PostToolUse` attaches the review to the thread its tool call named; the `Stop` hook holds the end of the turn and returns the follow-up as `decision: "block"`, which Codex runs in the same turn. Codex runs these hooks only after the person trusts them once ("Hooks need review": "Trust all and continue"). Without them the relay falls back to the host's own `codex queue --thread`, which a Codex CLI or app-server daemon that has the thread loaded runs at once, but Codex Desktop does not run on its own. |
 | Claude Code (CLI, desktop) | `install claude-code` | A background `asyncRewake` hook wakes the idle session; a busy session reads it after its current tool call. The hook waits inside the session's own CLI process, so a session that is not running cannot take it: in the CLI, resuming it (`claude --resume <session id>`) hands over anything that arrived meanwhile. Claude Desktop stops idle sessions when memory runs low, and only opening such a session in the app does not start it again: send it a message (any message) and the app resumes it, which hands the feedback over. Rewinding a conversation in the app stops its CLI the same way, and the next message starts it under a new session id; the hook keeps feedback under the app's own name for the conversation (`CLAUDE_CODE_HOST_SESSION_ID`), so it still arrives. Until then the App's receipt says the original conversation is not running and asks the person to do that. `claude -p "<prompt>"` runs the hook in the foreground, so there the call that opens a review waits for the report, and `sandbox_report` returns at once. |
 | Cursor | `install cursor` | `afterMCPExecution` attaches the review; the `stop` hook returns it as `followup_message`. Not yet verified end to end with a real Cursor agent. |
 | Gemini CLI | `install gemini` | `AfterTool` attaches the review; the `AfterAgent` hook returns it with `decision: "block"`. |
@@ -224,9 +224,10 @@ user settings (Claude Code honours `CLAUDE_CONFIG_DIR`), keeps everything else a
 previous file. Cursor also runs Claude Code's hooks by default; the Claude Code hook acts only inside the Claude Code
 session that runs it (`CLAUDE_CODE_SESSION_ID`), so it never blocks or misroutes a Cursor conversation.
 
-Cursor and Gemini CLI have no way to wake an idle conversation. Their end-of-turn hook waits up to 20 minutes
+Cursor, Gemini CLI and Codex have no way to wake an idle conversation. Their end-of-turn hook waits up to 20 minutes
 (`PSBX_HOOK_HOLD_SEC`) right after a review is requested, and otherwise delivers waiting feedback when that
-conversation's next turn ends.
+conversation's next turn ends. While a Codex turn has ended without its hook waiting, the App's receipt asks the person
+to send that conversation a message, which hands the feedback over at the end of that turn.
 
 State lives in `~/.cache/parallelsandbox/feedback` (override with `PSBX_FEEDBACK_DIR`), mode 0600, for seven days.
 A report is never handed to a different conversation, never queued twice, and a hook whose host process has exited
