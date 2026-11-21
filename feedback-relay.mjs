@@ -11,8 +11,9 @@
 //   relay    -> registers a feedback consumer per conversation, claims App reports, delivers:
 //                 hook   : a private mailbox the conversation's hook waits on (feedback-hook.mjs); a Codex thread
 //                          its hook attached takes it here, at the end of its turn (Stop)
-//                 codex  : otherwise `codex queue --thread` into Codex's own follow-up queue, which runs only while a
-//                          Codex CLI or app-server daemon has the thread loaded (Codex Desktop does not run it)
+//                 codex  : otherwise `codex queue --thread` into Codex's own follow-up queue, which a Codex CLI or
+//                          app-server daemon with the thread loaded runs at once, and Codex Desktop runs when its
+//                          wake link opens (codex://threads/wake/<thread id>), even while the conversation is not open
 //               and acknowledges host acceptance only after the host took the follow-up.
 //               A Claude Code follow-up no waiter is left to take (the conversation is closed or was stopped
 //               by Claude Desktop) is reported to the App as host_inactive, so the person can resume it.
@@ -26,6 +27,8 @@
 // one 25-second poll per conversation, one heartbeat per adapter.
 // Credentials stay in the adapter and relay environments; state files hold ids only. The relay reads a state directory
 // again only when it changed, and drops a delivery's journal and mail with its report, after 7 days.
+// A relay keeps the code it started with: an adapter from a newer package stops a relay started by an older one and
+// starts its own, so the newer delivery routes apply without waiting for the machine to restart.
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
@@ -35,6 +38,15 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
+export const VERSION = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")).version;
+// Whether relay version a is older than b; a relay that names no version predates the field.
+export function versionBelow(a, b) {
+  if (!a) return true;
+  const parts = (v) => String(v).split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const x = parts(a), y = parts(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0);
+  return false;
+}
 export const TICKET_LIFETIME_MS = 7 * 24 * 3600_000; // Reports and media are kept for 7 days.
 export const HOOK_HOSTS = Object.freeze(["claude-code", "cursor", "gemini", "codex"]);
 export const CAPABILITIES = Object.freeze({ codex: "codex/thread-queue", "claude-code": "claude-code/async-rewake", cursor: "cursor/stop-followup", gemini: "gemini-cli/after-agent" });
@@ -179,7 +191,7 @@ export function followUpText(event) {
 }
 
 // ---------- adapter side ----------
-export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, headers, env = process.env, dir = defaultFeedbackDir(env), spawnRelay = spawnDetachedRelay, findCli = hostCodexCli, log = () => {}, pid = process.pid }) {
+export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, headers, env = process.env, dir = defaultFeedbackDir(env), spawnRelay = spawnDetachedRelay, findCli = hostCodexCli, log = () => {}, pid = process.pid, platform = process.platform }) {
   const api = apiUrl.replace(/\/+$/, "");
   const p = paths(dir);
   const credKey = credentialKey(env, api, mcpUrl);
@@ -225,8 +237,12 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
       writeJson(file, ticket);
       await spawnRelay({ dir, credKey, env, log });
       if (threadId && !ticket.codex) return { automatic: false, host: "codex", reason: "codex_cli_not_found", note: "Set PSBX_CODEX_CLI to this host's absolute codex executable." };
-      // Codex Desktop does not run codex queue on its own: feedback is automatic once the Codex hooks are installed and trusted.
-      if (ticket.codex) return { automatic: "when_hooks_installed", host: "codex", route: "Codex Stop hook", threadId };
+      // Codex Desktop runs the queued follow-up once woken, so its feedback returns either way (in the same turn through
+      // the Codex hooks, otherwise as the next turn); a Codex CLI conversation gets it in the same turn once the hooks
+      // are installed and trusted.
+      if (ticket.codex) return desktopCodex(ticket.codex.cliPath, platform)
+        ? { automatic: true, host: "codex", route: "Codex Stop hook, or codex queue woken in Codex Desktop", threadId }
+        : { automatic: "when_hooks_installed", host: "codex", route: "Codex Stop hook", threadId };
       return { automatic: "when_hooks_installed", host: clientName || "unknown", route: "host hook" };
     },
     // The original conversation read this exact report: the App receipt becomes `read`. A design report is read without
@@ -252,16 +268,34 @@ export function createFeedbackRoute({ apiUrl, mcpUrl, agentId, authorizedFetch, 
   };
 }
 
-export async function spawnDetachedRelay({ dir, credKey, env }) {
+// A running relay from an older package (its features file names an older version, or none) is stopped first and
+// this package's relay takes over its tickets; one as new or newer keeps running.
+export async function spawnDetachedRelay({ dir, credKey, env, stop = stopRelay, start = startRelay }) {
   const p = paths(dir);
   privateDir(p.run);
   const pid = Number(orNull(() => readFileSync(join(p.run, `relay-${credKey}.pid`), "utf8")) || 0);
-  if (alive(pid)) return { running: true, pid, started: false };
-  const out = openSync(join(p.run, `relay-${credKey}.log`), "a", 0o600);
+  if (alive(pid)) {
+    const features = ticketOrNull(relayFeaturesFile(dir, credKey));
+    const outdated = features ? features.pid === pid && versionBelow(features.version, VERSION) : true;
+    if (!outdated || !(await stop(pid))) return { running: true, pid, started: false };
+  }
+  return { running: true, pid: start({ dir, credKey, env }), started: true };
+}
+
+function startRelay({ dir, credKey, env }) {
+  const out = openSync(join(paths(dir).run, `relay-${credKey}.log`), "a", 0o600);
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "relay", "--dir", dir, "--cred", credKey], { detached: true, stdio: ["ignore", out, out], env });
   child.unref();
   closeSync(out);
-  return { running: true, pid: child.pid, started: true };
+  return child.pid;
+}
+
+// SIGTERM: a relay from this package finishes the delivery in hand and exits; an older one exits at once, and what it
+// had claimed but not delivered is claimed again once its lease runs out.
+export async function stopRelay(pid, { timeoutMs = 10_000 } = {}) {
+  try { process.kill(pid, "SIGTERM"); } catch { return !alive(pid); }
+  for (const end = Date.now() + timeoutMs; Date.now() < end && alive(pid);) await sleep(100);
+  return !alive(pid);
 }
 
 // ---------- hook side: attach a review to the calling conversation ----------
@@ -383,7 +417,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
   const owner = Number(orNull(() => readFileSync(pidFile, "utf8")) || 0);
   if (owner && owner !== process.pid && alive(owner)) { say("another relay owns", credKey); return; }
   writeFileSync(pidFile, String(process.pid), { mode: 0o600 });
-  if (!once) writeJson(featuresFile, { pid: process.pid, presence: true, batchClaim: true });
+  if (!once) writeJson(featuresFile, { pid: process.pid, presence: true, batchClaim: true, version: VERSION });
   const controller = new AbortController();
   if (signal) { if (signal.aborted) controller.abort(); else signal.addEventListener("abort", () => controller.abort(), { once: true }); }
   const consumers = new Map(); // consumerId -> { id, agentId, ticket, target }: every conversation the one claim asks for
@@ -743,13 +777,26 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
   }
 }
 
-export async function codexQueue(target, message) {
+// The codex that launched the adapter is Codex Desktop's own (inside its app bundle on macOS).
+export function desktopCodex(cliPath, platform = process.platform) {
+  return platform === "darwin" && /\.app\/Contents\/Resources\/codex-cli\//.test(cliPath || "");
+}
+
+// Codex Desktop runs a thread's queued follow-up when its wake link opens, whether or not that conversation is open;
+// -g leaves the person's frontmost app in front.
+export async function wakeCodexDesktop(threadId, { open = (url) => run("open", ["-g", url], { timeout: 15_000 }) } = {}) {
+  await open(`codex://threads/wake/${threadId}`);
+}
+
+export async function codexQueue(target, message, { wake = wakeCodexDesktop, platform = process.platform } = {}) {
   accessSync(target.cliPath, constants.X_OK);
   const env = { ...process.env, ...(target.codexHome ? { CODEX_HOME: target.codexHome } : {}) };
   try {
     const { stdout } = await run(target.cliPath, ["queue", "--thread", target.threadId, "--message", message], { env, timeout: 60_000, maxBuffer: 1 << 20 });
     const m = stdout.match(/Queued message (\S+) for thread (\S+?)\.?\s*$/m);
     if (!m || m[2] !== target.threadId) { const err = new Error("codex queue did not confirm the original thread"); err.uncertain = true; throw err; }
+    // The follow-up is in the thread's queue either way; without Codex Desktop running, it waits for the thread's next start.
+    if (desktopCodex(target.cliPath, platform)) await wake(target.threadId).catch(() => {});
     return m[1];
   } catch (err) {
     if (err.uncertain) throw err;
@@ -763,5 +810,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1] && pro
   const opt = (name) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : ""; };
   const dir = opt("dir"), cred = opt("cred");
   if (!isAbsolute(dir || "") || !/^[0-9a-f]{16}$/.test(cred || "")) { console.error("relay --dir <absolute> --cred <key>"); process.exit(2); }
-  runRelay({ dir, credKey: cred }).then(() => process.exit(0), (err) => { console.error(stamp(), "relay stopped:", err?.message || err); process.exit(1); });
+  const stopping = new AbortController();
+  process.once("SIGTERM", () => { console.log(stamp(), "relay stopping (SIGTERM)"); stopping.abort(); });
+  runRelay({ dir, credKey: cred, signal: stopping.signal }).then(() => process.exit(0), (err) => { console.error(stamp(), "relay stopped:", err?.message || err); process.exit(1); });
 }

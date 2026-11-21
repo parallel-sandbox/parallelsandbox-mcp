@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { attachReview, attachSiblings, codexThreadId, createFeedbackRoute, credentialKey, followUpText, hostCodexCli, mailFor, paths, presenceFile, PRESENCE_STALE_MS, readJson, relayFeaturesFile, runRelay, sessionKey, sleep, takeMail, TICKET_LIFETIME_MS, ticketKey, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
+import { attachReview, attachSiblings, codexQueue, codexThreadId, createFeedbackRoute, credentialKey, desktopCodex, followUpText, hostCodexCli, mailFor, paths, presenceFile, PRESENCE_STALE_MS, readJson, relayFeaturesFile, runRelay, sessionKey, sleep, spawnDetachedRelay, takeMail, TICKET_LIFETIME_MS, ticketKey, VERSION, versionBelow, waiterPidFile, waiterRunning, writeJson } from "./feedback-relay.mjs";
 import { desktopConversation, foregroundHookArgs, hookInput, hostAncestors, hostGone, hostRunsHookInForeground, isClaudeCodeHook, reviewAwaitsPerson, reviewFromResult, runHook } from "./feedback-hook.mjs";
 import { hooksInstalled, hostConfig, hostFromClient, install, installNote, mergeHooks, reviewInstallNote, selfCommand, setupInstructions } from "./feedback-install.mjs";
 
@@ -70,10 +70,69 @@ test("host CLI is the codex process that launched the adapter", async () => {
   assert.equal(await hostCodexCli({ env: {}, pid: 10, ps: async () => null }), "");
 });
 
+const DESKTOP_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
+
+test("only the codex inside Codex Desktop's app bundle on macOS is Codex Desktop", () => {
+  assert.equal(desktopCodex(DESKTOP_CODEX, "darwin"), true);
+  assert.equal(desktopCodex("/opt/homebrew/bin/codex", "darwin"), false);
+  assert.equal(desktopCodex(DESKTOP_CODEX, "linux"), false);
+  assert.equal(desktopCodex("", "darwin"), false);
+});
+
+test("Codex Desktop review: feedback returns automatically, with or without the Codex hooks", async () => {
+  const review = (platform) => route(tmp(), { findCli: async () => DESKTOP_CODEX, platform }).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
+  const desktop = await review("darwin");
+  assert.equal(desktop.automatic, true);
+  assert.equal(desktop.threadId, T);
+  assert.equal((await review("linux")).automatic, "when_hooks_installed");
+});
+
+test("codex queue wakes the thread in Codex Desktop, and the queued follow-up stands when the wake fails", async () => {
+  const dir = tmp();
+  const bin = join(dir, "ChatGPT.app", "Contents", "Resources", "codex-cli");
+  mkdirSync(bin, { recursive: true });
+  const cliPath = join(bin, "codex");
+  writeFileSync(cliPath, `#!${process.execPath}\nif (process.argv[2] !== "queue") process.exit(2);\nconsole.log("Queued message q-1 for thread " + process.argv[process.argv.indexOf("--thread") + 1] + ".");\n`, { mode: 0o700 });
+  const woke = [];
+  assert.equal(await codexQueue({ cliPath, threadId: T }, "follow-up", { platform: "darwin", wake: async (id) => { woke.push(id); } }), "q-1");
+  assert.deepEqual(woke, [T]);
+  assert.equal(await codexQueue({ cliPath, threadId: T }, "follow-up", { platform: "linux", wake: async (id) => { woke.push(id); } }), "q-1");
+  assert.deepEqual(woke, [T], "a Codex CLI's daemon runs the queue on its own");
+  assert.equal(await codexQueue({ cliPath, threadId: T }, "follow-up", { platform: "darwin", wake: async () => { throw new Error("Codex Desktop is not installed"); } }), "q-1");
+});
+
+test("relay versions compare by number; a relay that names none is older", () => {
+  assert.equal(versionBelow(undefined, "0.8.1"), true);
+  assert.equal(versionBelow("0.7.9", "0.8.1"), true);
+  assert.equal(versionBelow("0.8.1", "0.8.1"), false);
+  assert.equal(versionBelow("0.8.10", "0.8.9"), false);
+  assert.equal(versionBelow("1.0.0", "0.8.1"), false);
+});
+
+test("an adapter replaces a running relay from an older package and keeps one as new or newer", async () => {
+  const dir = tmp();
+  const credKey = "0123456789abcdef";
+  mkdirSync(paths(dir).run, { recursive: true });
+  writeFileSync(join(paths(dir).run, `relay-${credKey}.pid`), String(process.pid));
+  const stopped = [];
+  const spawnWith = (stopOk = true) => spawnDetachedRelay({ dir, credKey, env: {}, stop: async (pid) => { stopped.push(pid); return stopOk; }, start: () => 777 });
+  writeJson(relayFeaturesFile(dir, credKey), { pid: process.pid, presence: true, batchClaim: true });
+  assert.deepEqual(await spawnWith(), { running: true, pid: 777, started: true }, "a relay from before the version field");
+  writeJson(relayFeaturesFile(dir, credKey), { pid: process.pid, presence: true, batchClaim: true, version: "0.0.1" });
+  assert.deepEqual(await spawnWith(false), { running: true, pid: process.pid, started: false }, "a relay that did not stop keeps its place");
+  writeJson(relayFeaturesFile(dir, credKey), { pid: process.pid, presence: true, batchClaim: true, version: VERSION });
+  assert.deepEqual(await spawnWith(), { running: true, pid: process.pid, started: false });
+  writeJson(relayFeaturesFile(dir, credKey), { pid: process.pid, presence: true, batchClaim: true, version: "999.0.0" });
+  assert.deepEqual(await spawnWith(), { running: true, pid: process.pid, started: false }, "a newer package's relay");
+  writeJson(relayFeaturesFile(dir, credKey), { pid: 999999, presence: true, batchClaim: true, version: "0.0.1" });
+  assert.deepEqual(await spawnWith(), { running: true, pid: process.pid, started: false }, "a features file left by another relay says nothing about this one");
+  assert.deepEqual(stopped, [process.pid, process.pid]);
+});
+
 test("Codex review: ticket names the thread, relay queues one follow-up and acknowledges it", async () => {
   const dir = tmp();
   const out = await route(dir).trackReview({ boxId: "box1", reviewId: "rev1", clientName: "codex-mcp-client", meta: { threadId: T } });
-  assert.equal(out.automatic, "when_hooks_installed", "Codex Desktop runs nothing from codex queue on its own");
+  assert.equal(out.automatic, "when_hooks_installed", "a Codex CLI conversation runs codex queue only while its daemon has the thread loaded");
   const be = backend([{ boxId: "box1", reviewId: "rev1", reportId: RID }]);
   const queued = [];
   await runRelay({ dir, credKey: credOf(dir), fetchImpl: be.fetchImpl, once: true, queue: async (t, msg) => { queued.push({ t, msg }); return "q1"; } });
@@ -965,7 +1024,7 @@ test("a relay stays up while a conversation on the machine is live, and says it 
   const running = runRelay({ dir, credKey, fetchImpl: backend([]).fetchImpl, scanMs: 5, heartbeatMs: 20, idleExitMs: 10, print: () => {} }).then(() => { finished = true; });
   await pause(150);
   assert.equal(finished, false, "a live conversation keeps the relay up");
-  assert.deepEqual(readJson(relayFeaturesFile(dir, credKey)), { pid: process.pid, presence: true, batchClaim: true });
+  assert.deepEqual(readJson(relayFeaturesFile(dir, credKey)), { pid: process.pid, presence: true, batchClaim: true, version: VERSION });
   a.dropPresence();
   await until(() => finished);
   await running;
