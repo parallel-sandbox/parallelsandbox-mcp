@@ -10,10 +10,11 @@
 //                 Claude Code, Cursor, Gemini CLI: their after-tool hook attaches its session id
 //   relay    -> registers a feedback consumer per conversation, claims App reports, delivers:
 //                 hook   : a private mailbox the conversation's hook waits on (feedback-hook.mjs); a Codex thread
-//                          its hook attached takes it here, at the end of its turn (Stop)
+//                          takes it here while its Stop hook holds the end of the turn that opened the review
 //                 codex  : otherwise `codex queue --thread` into Codex's own follow-up queue, which a Codex CLI or
 //                          app-server daemon with the thread loaded runs at once, and Codex Desktop runs when its
-//                          wake link opens (codex://threads/wake/<thread id>), even while the conversation is not open
+//                          wake link opens (codex://threads/wake/<thread id>), even while the conversation is not open;
+//                          chosen when the follow-up is sent, so feedback arriving after the turn ended is not left waiting
 //               and acknowledges host acceptance only after the host took the follow-up.
 //               A Claude Code follow-up no waiter is left to take (the conversation is closed or was stopped
 //               by Claude Desktop) is reported to the App as host_inactive, so the person can resume it.
@@ -455,11 +456,17 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
       }
     };
     const request = (ticket, agentId, path, body) => call(ticket, agentId, `/v1/feedback-consumers${path}`, body);
-    // A Codex thread whose hook attached the review takes feedback through that hook (same consumer: host codex, its
-    // thread id); without the hook only codex queue reaches it.
+    // A Codex review belongs to the thread its tool call named; whether its Stop hook or codex queue takes a follow-up
+    // is decided when that follow-up is sent (deliver).
     const targetOf = (ticket, a) => {
-      if (ticket.codex && a?.host !== "codex") return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
+      if (ticket.codex) return { kind: "codex", host: "codex", id: ticket.codex.threadId, codex: ticket.codex };
       return a ? { kind: "hook", host: a.host, id: a.session } : null;
+    };
+    // A review handed over through codex queue: no later Stop hook of that thread holds its turn for it.
+    const handOverAttach = (event) => {
+      const file = join(p.attach, `${ticketKey(event.boxId, event.reviewId)}.json`);
+      const a = orNull(() => readJson(file));
+      if (a && !a.delivered) writeJson(file, { ...a, delivered: Date.now() });
     };
     // Where a ticket's feedback goes, worked out again only when its ticket or attach file changed.
     const routeOf = (file, attach) => {
@@ -475,12 +482,16 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
       if (j && (j.reportId !== event.reportId || j.boxId !== event.boxId)) throw new Error("delivery journal does not match its event");
       if (j?.state === "sending") { say("uncertain earlier codex queue attempt for", event.reportId, "- not repeating"); return; }
       if (!j) {
+        // A Codex thread takes the follow-up in the same turn while its Stop hook holds the end of that turn, and
+        // otherwise as its next turn through codex queue.
+        const queued = consumer.target.kind === "codex" && !(await waiting({ dir, host: "codex", session: consumer.target.id }));
         j = { consumerId: consumer.id, agentId: consumer.agentId, host: consumer.target.host, target: consumer.target.id, eventId: event.eventId, ...(event.boxId ? { boxId: event.boxId } : {}), reviewId: event.reviewId, reportId: event.reportId, leaseToken: event.leaseToken, state: "sending" };
         writeJson(jpath, j);
-        if (consumer.target.kind === "codex") {
+        if (queued) {
           try { j.queuedId = await queue({ ...consumer.target.codex, threadId: consumer.target.id }, followUpText(event)); }
           catch (err) { if (!err.uncertain) unlinkSync(jpath); throw err; }
           j.state = "handed";
+          handOverAttach(event);
           say("queued report", event.reportId, "as", j.queuedId, "for codex thread", consumer.target.id);
         } else {
           const box = privateDir(join(p.mail, sessionKey(consumer.target.host, consumer.target.id)));
@@ -709,7 +720,7 @@ export async function runRelay({ dir, credKey, env = process.env, fetchImpl, que
         if (!ticket || ticket.credKey !== credKey) continue;
         active++;
         const attach = attached.get(name);
-        const { target, consumerId } = routeOf(file, ticket.codex && attach?.value?.host !== "codex" ? undefined : attach);
+        const { target, consumerId } = routeOf(file, attach);
         if (!target) continue;
         if (gone.has(consumerId)) continue;
         if (bound.get(key) !== consumerId) {

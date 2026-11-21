@@ -346,7 +346,7 @@ const codexReviewResult = (reviewId) => ({ content: [{ type: "text", text: JSON.
 
 // Codex Desktop never starts a turn from codex queue (11/21: queued follow-ups sat unread for days), so with ParallelSandbox's
 // Codex hooks the thread's own PostToolUse attaches the review and its Stop hook takes the feedback into the same turn.
-test("Codex with its hooks: the thread attaches its review, the relay mails it instead of codex queue, and Stop blocks with it", async () => {
+test("Codex with its hooks: the thread attaches its review; feedback after its turn ended goes to codex queue and no later Stop holds for it", async () => {
   const dir = tmp();
   await route(dir).trackReview({ boxId: "box1", reviewId: "rev123", clientName: "codex-mcp-client", meta: { threadId: T } });
   let out = "";
@@ -358,16 +358,32 @@ test("Codex with its hooks: the thread attaches its review, the relay mails it i
   const be = backend([{ boxId: "box1", reviewId: "rev123", reportId: RID }]);
   const queued = [];
   await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, queue: async (t, msg) => { queued.push({ t, msg }); return "q1"; } });
-  assert.equal(queued.length, 0, "no codex queue once the thread's hook has the review");
+  assert.equal(queued.length, 1, "no Stop hook holds the thread: its next turn takes it from codex queue");
+  assert.match(queued[0].msg, /sandbox_report tool with exactly \{"id":"box1","reportId":"11111111-2222-3333-4444-555555555555"\}/);
   assert.equal(be.calls[0].body.host, "codex");
-  assert.equal(be.acked.size, 0, "not accepted before the thread takes it");
-  await runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "1" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: false }, out: (s) => { out = s; } });
-  assert.equal(JSON.parse(out).decision, "block");
-  assert.match(JSON.parse(out).reason, /sandbox_report tool with exactly \{"id":"box1","reportId":"11111111-2222-3333-4444-555555555555"\}/);
-  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, queue: async () => { throw new Error("never queued"); } });
+  assert.equal(mailFor({ dir, host: "codex", session: T }).length, 0);
   assert.equal(be.acked.get(RID), "host_accepted");
-  await runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "1" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: true }, out: (s) => { out = s; } });
+  const started = Date.now();
+  await runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "20" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: false }, out: (s) => { out = s; } });
   assert.equal(out, "{}", "nothing more to hand over");
+  assert.ok(Date.now() - started < 1500, "the next turn's Stop does not hold for feedback the thread already has");
+});
+
+test("a Codex Stop hook lets the turn end once the review it held for went to the thread through codex queue", async () => {
+  const dir = tmp();
+  await route(dir).trackReview({ boxId: "box1", reviewId: "rev123", clientName: "codex-mcp-client", meta: { threadId: T } });
+  await runHook({ host: "codex", dir, raw: { hook_event_name: "PostToolUse", session_id: T, tool_name: "mcp__parallelsandbox__sandbox_review", tool_input: { id: "box1" }, tool_response: codexReviewResult("rev123") }, out: () => {} });
+  let out = "";
+  const started = Date.now();
+  const stop = runHook({ host: "codex", dir, env: { PSBX_HOOK_HOLD_SEC: "20" }, raw: { hook_event_name: "Stop", session_id: T, stop_hook_active: false }, out: (s) => { out = s; } });
+  await sleep(300);
+  const queued = [];
+  // The relay looked for the thread's waiter just before this hook started holding.
+  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: backend([{ boxId: "box1", reviewId: "rev123", reportId: RID }]).fetchImpl, once: true, waiting: async () => false, queue: async (t) => { queued.push(t); return "q1"; } });
+  assert.equal(queued.length, 1);
+  assert.equal(await stop, 0);
+  assert.equal(out, "{}");
+  assert.ok(Date.now() - started < 10_000, "released once the review was handed over");
 });
 
 test("Codex Stop right after a review holds as the thread's waiter and continues the turn when the feedback arrives", async () => {
@@ -380,7 +396,9 @@ test("Codex Stop right after a review holds as the thread's waiter and continues
   await sleep(300);
   assert.equal(Number(readFileSync(waiterPidFile(dir, "codex", T), "utf8")), process.pid, "the holding Stop hook is the thread's waiter");
   const be = backend([{ boxId: "box1", reviewId: "rev123", reportId: RID }]);
-  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, queue: async () => { throw new Error("never queued"); } });
+  // The test process stands in for the hook's own process, whose command line names `hook --host codex`.
+  const holding = async ({ host, session }) => host === "codex" && session === T && existsSync(waiterPidFile(dir, "codex", T));
+  await runRelay({ dir, credKey: credOf(dir, "box1", "rev123"), fetchImpl: be.fetchImpl, once: true, waiting: holding, queue: async () => { throw new Error("never queued"); } });
   assert.equal(await stop, 0);
   assert.equal(JSON.parse(out).decision, "block");
   assert.ok(Date.now() - started < 10_000, "handed over as soon as it was mailed");

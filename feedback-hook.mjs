@@ -92,15 +92,18 @@ export const hostGone = (ancestors) => ancestors.length > 0 && (process.ppid !==
 // A waiter polls every second for as long as its conversation lives, so it looks at the attach files and its mailbox
 // again only when their directories changed: reading every attach file each second, 22 waiters on a Mac took 38% of a
 // core (11/6).
-async function waitForMail({ dir, host, session, also = [], until, by, ancestors = [] }) {
+async function waitForMail({ dir, host, session, also = [], until, by, ancestors = [], holdWhile }) {
   const p = paths(dir), sessions = [session, ...also];
   const reviewsChanged = dirWatch([p.attach, p.tickets]), mailChanged = dirWatch(sessions.map((s) => join(p.mail, sessionKey(host, s))));
   for (;;) {
     if (hostGone(ancestors)) return null;
-    if (reviewsChanged()) attachSiblings({ dir, host, session });
+    const reviews = reviewsChanged();
+    if (reviews) attachSiblings({ dir, host, session });
     if (mailChanged()) for (const entry of sessions.flatMap((s) => mailFor({ dir, host, session: s }))) {
       if (takeMail(entry, by)) { markDelivered(dir, entry.mail); return entry.mail; }
     }
+    // A Codex Stop hook lets its turn end once every review it held for was handed to the thread through codex queue.
+    if (reviews && holdWhile && !holdWhile()) return null;
     if (Date.now() >= until) return null;
     await sleep(Math.min(1000, until - Date.now()));
   }
@@ -225,7 +228,8 @@ export async function runHook({ host, raw, dir = defaultFeedbackDir(), env = pro
   const lock = host === "codex" && hold ? waiterPidFile(dir, host, input.session) : "";
   if (lock) { privateDir(paths(dir).run); writeFileSync(lock, String(process.pid), { mode: 0o600 }); }
   try {
-    const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + (hold ? holdMs : 0) + 1, by: `${host}:${process.pid}`, ancestors: hold ? await hostAncestors() : [] });
+    const mail = await waitForMail({ dir, host, session: input.session, until: Date.now() + (hold ? holdMs : 0) + 1, by: `${host}:${process.pid}`, ancestors: hold ? await hostAncestors() : [],
+      holdWhile: lock ? () => shouldHold({ dir, host, session: input.session, holdMs }) : undefined });
     if (!mail) { out("{}"); return 0; }
     out(JSON.stringify(host === "cursor" ? { followup_message: mail.text } : { decision: "block", reason: mail.text }));
     return 0;

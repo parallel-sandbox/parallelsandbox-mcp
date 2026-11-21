@@ -2,7 +2,7 @@
 
 > The default Codex route is ParallelSandbox's Codex hooks (`npx -y parallelsandbox-mcp install codex`, then trust them once in
 > Codex): `PostToolUse` attaches the review and `Stop` hands the feedback to the same turn (see README, "Feedback back to the
-> original conversation"). Without them the relay falls back to `codex queue`, and in Codex Desktop on macOS opens the thread's
+> original conversation"). Without them, or after that turn ended, the relay uses `codex queue`, and in Codex Desktop on macOS opens the thread's
 > wake link (`codex://threads/wake/<thread id>`) so Desktop runs the follow-up as the conversation's next turn.
 > This App Server bridge stays an explicit opt-in experiment.
 
