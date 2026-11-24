@@ -1,6 +1,7 @@
 # parallelsandbox-mcp
 
 [![parallel-sandbox/parallelsandbox-mcp MCP server](https://glama.ai/mcp/servers/parallel-sandbox/parallelsandbox-mcp/badges/score.svg)](https://glama.ai/mcp/servers/parallel-sandbox/parallelsandbox-mcp)
+[![ParallelSandbox MCP connector](https://glama.ai/mcp/connectors/com.parallelsandbox/parallelsandbox/badges/score.svg)](https://glama.ai/mcp/connectors/com.parallelsandbox/parallelsandbox)
 
 ParallelSandbox lines up the test builds your AI is working on, side by side. Open any build and use it like a real user. When something is off, just say it and circle it on the screen. Your feedback goes straight to the AI that built it, and the next version comes back for you to try. Use, talk, circle, repeat: that is how you iterate your app's user experience fast.
 
